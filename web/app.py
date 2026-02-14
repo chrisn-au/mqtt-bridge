@@ -316,6 +316,10 @@ btn, .btn { display: inline-block; padding: 0.5rem 1rem; border: none; border-ra
 .remove-btn:hover { color: #b91c1c; }
 .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem; }
 .header h1 { margin-bottom: 0; }
+.tls-toggle { margin-bottom: 0.75rem; }
+.toggle-label { display: flex; align-items: center; gap: 0.5rem; font-size: 0.9rem; cursor: pointer; }
+.toggle-label input[type="checkbox"] { width: 1rem; height: 1rem; cursor: pointer; }
+.tls-hint { font-size: 0.8rem; color: var(--muted); font-weight: 400; }
 @media (max-width: 600px) {
     .form-row, .form-row-3 { grid-template-columns: 1fr; }
     .grid { grid-template-columns: 1fr 1fr; }
@@ -380,21 +384,50 @@ btn, .btn { display: inline-block; padding: 0.5rem 1rem; border: none; border-ra
                     <select id="mqtt-clean_session"><option value="">default</option>
                     <option value="true">true</option><option value="false">false</option></select></div>
             </div>
-            <div class="form-row-3">
+            <div class="form-row">
                 <div><label>MQTT Protocol</label>
-                    <select id="mqtt-mqtt_protocol"><option value="">default</option>
+                    <select id="mqtt-mqtt_protocol"><option value="">default (3.1.1)</option>
                     <option value="3.1">3.1</option><option value="3.1.1">3.1.1</option><option value="5">5</option></select></div>
-                <div><label>TLS Version</label>
-                    <select id="mqtt-tls_version"><option value="">none</option>
-                    <option value="tlsv1">tlsv1</option><option value="tlsv1.1">tlsv1.1</option><option value="tlsv1.2">tlsv1.2</option></select></div>
-                <div><label>Verify CA Cert</label>
-                    <select id="mqtt-verify_ca_cert"><option value="">default</option>
-                    <option value="true">true</option><option value="false">false</option></select></div>
+                <div></div>
             </div>
-            <div class="form-row-3">
-                <div><label>CA Cert Path</label><input type="text" id="mqtt-ca_cert_path"></div>
-                <div><label>Cert Path</label><input type="text" id="mqtt-cert_path"></div>
-                <div><label>Key Path</label><input type="text" id="mqtt-key_path"></div>
+
+            <!-- TLS Section -->
+            <div class="tls-toggle">
+                <label class="toggle-label">
+                    <input type="checkbox" id="tls-enabled"> <strong>Enable TLS</strong>
+                    <span class="tls-hint" id="tls-hint"></span>
+                </label>
+            </div>
+            <div id="tls-options" style="display:none">
+                <div class="form-row-3">
+                    <div><label>TLS Version</label>
+                        <select id="mqtt-tls_version">
+                        <option value="tlsv1.2">TLS 1.2 (recommended)</option>
+                        <option value="tlsv1.1">TLS 1.1</option>
+                        <option value="tlsv1">TLS 1.0</option></select></div>
+                    <div><label>CA Certificate</label>
+                        <select id="mqtt-ca_cert_path">
+                        <option value="/etc/ssl/certs/ca-certificates.crt">System CA bundle (default)</option>
+                        <option value="custom">Custom path...</option></select></div>
+                    <div><label>Verify Server Cert</label>
+                        <select id="mqtt-verify_ca_cert"><option value="">yes (default)</option>
+                        <option value="false">no (insecure)</option></select></div>
+                </div>
+                <div id="ca-custom-row" style="display:none">
+                    <label>Custom CA Cert Path</label>
+                    <input type="text" id="mqtt-ca_cert_path_custom" placeholder="/path/to/ca.crt">
+                </div>
+                <div class="tls-toggle" style="margin-top:0.25rem">
+                    <label class="toggle-label">
+                        <input type="checkbox" id="client-cert-enabled"> Use client certificate (mutual TLS)
+                    </label>
+                </div>
+                <div id="client-cert-options" style="display:none">
+                    <div class="form-row">
+                        <div><label>Client Cert Path</label><input type="text" id="mqtt-cert_path" placeholder="/etc/openmmg/certs/client.crt"></div>
+                        <div><label>Client Key Path</label><input type="text" id="mqtt-key_path" placeholder="/etc/openmmg/certs/client.key"></div>
+                    </div>
+                </div>
             </div>
         </div>
 
@@ -470,18 +503,74 @@ function refreshStatus() {
     }).catch(() => showToast('Failed to load status', 'error'));
 }
 
+// --- TLS UI ---
+const tlsToggle = document.getElementById('tls-enabled');
+const tlsOptions = document.getElementById('tls-options');
+const clientCertToggle = document.getElementById('client-cert-enabled');
+const clientCertOptions = document.getElementById('client-cert-options');
+const caSelect = document.getElementById('mqtt-ca_cert_path');
+const caCustomRow = document.getElementById('ca-custom-row');
+const portField = document.getElementById('mqtt-port');
+const tlsHint = document.getElementById('tls-hint');
+
+tlsToggle.addEventListener('change', () => {
+    tlsOptions.style.display = tlsToggle.checked ? 'block' : 'none';
+});
+clientCertToggle.addEventListener('change', () => {
+    clientCertOptions.style.display = clientCertToggle.checked ? 'block' : 'none';
+});
+caSelect.addEventListener('change', () => {
+    caCustomRow.style.display = caSelect.value === 'custom' ? 'block' : 'none';
+});
+portField.addEventListener('input', () => {
+    const port = portField.value.trim();
+    if (port === '8883' && !tlsToggle.checked) {
+        tlsHint.textContent = '(port 8883 typically requires TLS)';
+        tlsToggle.checked = true;
+        tlsOptions.style.display = 'block';
+    } else if (port === '1883' && tlsToggle.checked) {
+        tlsHint.textContent = '(port 1883 is typically plain MQTT)';
+    } else {
+        tlsHint.textContent = '';
+    }
+});
+
 // --- Config ---
-const MQTT_FIELDS = ['host','port','request_topic','response_topic','username','password',
-    'client_id','keepalive','qos','retain','clean_session','mqtt_protocol',
-    'tls_version','verify_ca_cert','ca_cert_path','cert_path','key_path'];
+const MQTT_SIMPLE_FIELDS = ['host','port','request_topic','response_topic','username','password',
+    'client_id','keepalive','qos','retain','clean_session','mqtt_protocol'];
 
 function loadConfig() {
     fetch('/api/config').then(r => r.json()).then(data => {
-        // MQTT
-        MQTT_FIELDS.forEach(f => {
+        // Simple MQTT fields
+        MQTT_SIMPLE_FIELDS.forEach(f => {
             const el = document.getElementById('mqtt-' + f);
             if (el) el.value = data.mqtt[f] || '';
         });
+        // TLS fields
+        const hasTls = data.mqtt.tls_version || data.mqtt.ca_cert_path;
+        tlsToggle.checked = !!hasTls;
+        tlsOptions.style.display = hasTls ? 'block' : 'none';
+        if (data.mqtt.tls_version) {
+            document.getElementById('mqtt-tls_version').value = data.mqtt.tls_version;
+        }
+        if (data.mqtt.verify_ca_cert) {
+            document.getElementById('mqtt-verify_ca_cert').value = data.mqtt.verify_ca_cert;
+        }
+        // CA cert path
+        const caPath = data.mqtt.ca_cert_path || '';
+        if (caPath && caPath !== '/etc/ssl/certs/ca-certificates.crt') {
+            caSelect.value = 'custom';
+            caCustomRow.style.display = 'block';
+            document.getElementById('mqtt-ca_cert_path_custom').value = caPath;
+        } else if (caPath) {
+            caSelect.value = caPath;
+        }
+        // Client cert
+        const hasClientCert = data.mqtt.cert_path || data.mqtt.key_path;
+        clientCertToggle.checked = !!hasClientCert;
+        clientCertOptions.style.display = hasClientCert ? 'block' : 'none';
+        if (data.mqtt.cert_path) document.getElementById('mqtt-cert_path').value = data.mqtt.cert_path;
+        if (data.mqtt.key_path) document.getElementById('mqtt-key_path').value = data.mqtt.key_path;
         // Serial gateways
         renderGateways(data.serial_gateways || []);
         // Rules
@@ -491,10 +580,26 @@ function loadConfig() {
 
 function collectConfig() {
     const mqtt = {};
-    MQTT_FIELDS.forEach(f => {
+    MQTT_SIMPLE_FIELDS.forEach(f => {
         const el = document.getElementById('mqtt-' + f);
         if (el && el.value) mqtt[f] = el.value;
     });
+    // TLS
+    if (tlsToggle.checked) {
+        mqtt.tls_version = document.getElementById('mqtt-tls_version').value;
+        const caVal = caSelect.value;
+        mqtt.ca_cert_path = (caVal === 'custom')
+            ? document.getElementById('mqtt-ca_cert_path_custom').value
+            : caVal;
+        const verify = document.getElementById('mqtt-verify_ca_cert').value;
+        if (verify) mqtt.verify_ca_cert = verify;
+        if (clientCertToggle.checked) {
+            const cert = document.getElementById('mqtt-cert_path').value;
+            const key = document.getElementById('mqtt-key_path').value;
+            if (cert) mqtt.cert_path = cert;
+            if (key) mqtt.key_path = key;
+        }
+    }
     return {
         mqtt: mqtt,
         serial_gateways: collectGateways(),
