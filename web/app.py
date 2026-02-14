@@ -105,6 +105,10 @@ def validate_config(config):
     if not mqtt.get("response_topic"):
         errors.append("MQTT response_topic is required")
 
+    host = mqtt.get("host", "")
+    if host and "://" in host:
+        errors.append("MQTT host must be a bare hostname or IP (no protocol prefix like mqtts://)")
+
     port = mqtt.get("port", "")
     if port and (not port.isdigit() or not (1 <= int(port) <= 65535)):
         errors.append("MQTT port must be 1-65535")
