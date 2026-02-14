@@ -6,10 +6,12 @@ import re
 import subprocess
 import json
 from flask import Flask, render_template_string, request, jsonify
+from werkzeug.utils import secure_filename
 
 app = Flask(__name__)
 
 CONFIG_PATH = "/etc/openmmg/openmmg.conf"
+CERTS_DIR = "/etc/openmmg/certs"
 
 # ---------------------------------------------------------------------------
 # Config parser / writer
@@ -243,6 +245,34 @@ def api_restart():
     return jsonify({"ok": True, "message": "openmmg restarted"})
 
 
+@app.route("/api/upload-cert", methods=["POST"])
+def api_upload_cert():
+    if "file" not in request.files:
+        return jsonify({"error": "No file provided"}), 400
+    f = request.files["file"]
+    if not f.filename:
+        return jsonify({"error": "No file selected"}), 400
+    filename = secure_filename(f.filename)
+    if not filename.endswith((".pem", ".crt", ".key", ".cer")):
+        return jsonify({"error": "File must be .pem, .crt, .key, or .cer"}), 400
+    os.makedirs(CERTS_DIR, exist_ok=True)
+    path = os.path.join(CERTS_DIR, filename)
+    f.save(path)
+    os.chmod(path, 0o600)
+    return jsonify({"ok": True, "path": path, "filename": filename})
+
+
+@app.route("/api/certs")
+def api_list_certs():
+    """List certificate files already on disk."""
+    certs = []
+    if os.path.isdir(CERTS_DIR):
+        for name in sorted(os.listdir(CERTS_DIR)):
+            if name.endswith((".pem", ".crt", ".key", ".cer")):
+                certs.append({"name": name, "path": os.path.join(CERTS_DIR, name)})
+    return jsonify(certs)
+
+
 # ---------------------------------------------------------------------------
 # HTML Template
 # ---------------------------------------------------------------------------
@@ -320,6 +350,17 @@ btn, .btn { display: inline-block; padding: 0.5rem 1rem; border: none; border-ra
 .toggle-label { display: flex; align-items: center; gap: 0.5rem; font-size: 0.9rem; cursor: pointer; }
 .toggle-label input[type="checkbox"] { width: 1rem; height: 1rem; cursor: pointer; }
 .tls-hint { font-size: 0.8rem; color: var(--muted); font-weight: 400; }
+.upload-area { margin-top: 0.75rem; }
+.upload-box { border: 2px dashed var(--border); border-radius: 8px; padding: 1rem;
+              text-align: center; cursor: pointer; transition: border-color 0.2s, background 0.2s; }
+.upload-box.drag-over { border-color: var(--primary); background: rgba(37,99,235,0.05); }
+.upload-text { font-size: 0.9rem; color: var(--muted); }
+.upload-link { color: var(--primary); cursor: pointer; text-decoration: underline; }
+.upload-hint { font-size: 0.75rem; color: var(--muted); margin-top: 0.25rem; }
+.cert-item { display: flex; align-items: center; justify-content: space-between;
+             padding: 0.4rem 0.6rem; margin-top: 0.5rem; background: var(--bg);
+             border-radius: 6px; font-size: 0.85rem; }
+.cert-item code { font-size: 0.8rem; color: var(--muted); }
 @media (max-width: 600px) {
     .form-row, .form-row-3 { grid-template-columns: 1fr; }
     .grid { grid-template-columns: 1fr 1fr; }
@@ -408,14 +449,10 @@ btn, .btn { display: inline-block; padding: 0.5rem 1rem; border: none; border-ra
                     <div><label>CA Certificate</label>
                         <select id="mqtt-ca_cert_path">
                         <option value="/etc/ssl/certs/ca-certificates.crt">System CA bundle (default)</option>
-                        <option value="custom">Custom path...</option></select></div>
+                        </select></div>
                     <div><label>Verify Server Cert</label>
                         <select id="mqtt-verify_ca_cert"><option value="">yes (default)</option>
                         <option value="false">no (insecure)</option></select></div>
-                </div>
-                <div id="ca-custom-row" style="display:none">
-                    <label>Custom CA Cert Path</label>
-                    <input type="text" id="mqtt-ca_cert_path_custom" placeholder="/path/to/ca.crt">
                 </div>
                 <div class="tls-toggle" style="margin-top:0.25rem">
                     <label class="toggle-label">
@@ -424,9 +461,19 @@ btn, .btn { display: inline-block; padding: 0.5rem 1rem; border: none; border-ra
                 </div>
                 <div id="client-cert-options" style="display:none">
                     <div class="form-row">
-                        <div><label>Client Cert Path</label><input type="text" id="mqtt-cert_path" placeholder="/etc/openmmg/certs/client.crt"></div>
-                        <div><label>Client Key Path</label><input type="text" id="mqtt-key_path" placeholder="/etc/openmmg/certs/client.key"></div>
+                        <div><label>Client Certificate</label>
+                            <select id="mqtt-cert_path"><option value="">-- select --</option></select></div>
+                        <div><label>Client Key</label>
+                            <select id="mqtt-key_path"><option value="">-- select --</option></select></div>
                     </div>
+                </div>
+                <div class="upload-area" id="cert-upload-area">
+                    <div class="upload-box" id="upload-box">
+                        <div class="upload-text">Drop certificate files here or <label class="upload-link" for="cert-file-input">browse</label></div>
+                        <div class="upload-hint">.pem, .crt, .key, .cer files</div>
+                        <input type="file" id="cert-file-input" multiple accept=".pem,.crt,.key,.cer" style="display:none">
+                    </div>
+                    <div id="cert-list"></div>
                 </div>
             </div>
         </div>
@@ -509,18 +556,18 @@ const tlsOptions = document.getElementById('tls-options');
 const clientCertToggle = document.getElementById('client-cert-enabled');
 const clientCertOptions = document.getElementById('client-cert-options');
 const caSelect = document.getElementById('mqtt-ca_cert_path');
-const caCustomRow = document.getElementById('ca-custom-row');
+const certSelect = document.getElementById('mqtt-cert_path');
+const keySelect = document.getElementById('mqtt-key_path');
 const portField = document.getElementById('mqtt-port');
 const tlsHint = document.getElementById('tls-hint');
+const uploadBox = document.getElementById('upload-box');
+const certFileInput = document.getElementById('cert-file-input');
 
 tlsToggle.addEventListener('change', () => {
     tlsOptions.style.display = tlsToggle.checked ? 'block' : 'none';
 });
 clientCertToggle.addEventListener('change', () => {
     clientCertOptions.style.display = clientCertToggle.checked ? 'block' : 'none';
-});
-caSelect.addEventListener('change', () => {
-    caCustomRow.style.display = caSelect.value === 'custom' ? 'block' : 'none';
 });
 portField.addEventListener('input', () => {
     const port = portField.value.trim();
@@ -534,6 +581,76 @@ portField.addEventListener('input', () => {
         tlsHint.textContent = '';
     }
 });
+
+// --- Cert upload ---
+uploadBox.addEventListener('click', () => certFileInput.click());
+uploadBox.addEventListener('dragover', e => { e.preventDefault(); uploadBox.classList.add('drag-over'); });
+uploadBox.addEventListener('dragleave', () => uploadBox.classList.remove('drag-over'));
+uploadBox.addEventListener('drop', e => {
+    e.preventDefault();
+    uploadBox.classList.remove('drag-over');
+    uploadFiles(e.dataTransfer.files);
+});
+certFileInput.addEventListener('change', () => uploadFiles(certFileInput.files));
+
+function uploadFiles(files) {
+    Array.from(files).forEach(file => {
+        const form = new FormData();
+        form.append('file', file);
+        fetch('/api/upload-cert', { method: 'POST', body: form })
+            .then(r => r.json())
+            .then(data => {
+                if (data.ok) {
+                    showToast('Uploaded ' + data.filename, 'success');
+                    refreshCerts();
+                } else {
+                    showToast(data.error, 'error');
+                }
+            }).catch(() => showToast('Upload failed', 'error'));
+    });
+}
+
+function refreshCerts(thenSelectCa, thenSelectCert, thenSelectKey) {
+    fetch('/api/certs').then(r => r.json()).then(certs => {
+        // Update CA dropdown (keep system bundle as first option)
+        const caVal = thenSelectCa || caSelect.value;
+        caSelect.innerHTML = '<option value="/etc/ssl/certs/ca-certificates.crt">System CA bundle (default)</option>';
+        certs.forEach(c => {
+            if (c.name.endsWith('.key')) return; // keys aren't CA certs
+            caSelect.insertAdjacentHTML('beforeend',
+                '<option value="' + c.path + '">' + c.name + '</option>');
+        });
+        if (caVal) caSelect.value = caVal;
+
+        // Update cert/key dropdowns
+        const certVal = thenSelectCert || certSelect.value;
+        const keyVal = thenSelectKey || keySelect.value;
+        certSelect.innerHTML = '<option value="">-- select --</option>';
+        keySelect.innerHTML = '<option value="">-- select --</option>';
+        certs.forEach(c => {
+            if (c.name.endsWith('.key')) {
+                keySelect.insertAdjacentHTML('beforeend',
+                    '<option value="' + c.path + '">' + c.name + '</option>');
+            } else {
+                certSelect.insertAdjacentHTML('beforeend',
+                    '<option value="' + c.path + '">' + c.name + '</option>');
+                // Also add to key in case naming is non-standard
+            }
+        });
+        if (certVal) certSelect.value = certVal;
+        if (keyVal) keySelect.value = keyVal;
+
+        // Show uploaded files list
+        const listEl = document.getElementById('cert-list');
+        if (certs.length) {
+            listEl.innerHTML = certs.map(c =>
+                '<div class="cert-item"><span>' + c.name + '</span><code>' + c.path + '</code></div>'
+            ).join('');
+        } else {
+            listEl.innerHTML = '';
+        }
+    });
+}
 
 // --- Config ---
 const MQTT_SIMPLE_FIELDS = ['host','port','request_topic','response_topic','username','password',
@@ -556,21 +673,12 @@ function loadConfig() {
         if (data.mqtt.verify_ca_cert) {
             document.getElementById('mqtt-verify_ca_cert').value = data.mqtt.verify_ca_cert;
         }
-        // CA cert path
-        const caPath = data.mqtt.ca_cert_path || '';
-        if (caPath && caPath !== '/etc/ssl/certs/ca-certificates.crt') {
-            caSelect.value = 'custom';
-            caCustomRow.style.display = 'block';
-            document.getElementById('mqtt-ca_cert_path_custom').value = caPath;
-        } else if (caPath) {
-            caSelect.value = caPath;
-        }
         // Client cert
         const hasClientCert = data.mqtt.cert_path || data.mqtt.key_path;
         clientCertToggle.checked = !!hasClientCert;
         clientCertOptions.style.display = hasClientCert ? 'block' : 'none';
-        if (data.mqtt.cert_path) document.getElementById('mqtt-cert_path').value = data.mqtt.cert_path;
-        if (data.mqtt.key_path) document.getElementById('mqtt-key_path').value = data.mqtt.key_path;
+        // Load cert files then set selected values
+        refreshCerts(data.mqtt.ca_cert_path, data.mqtt.cert_path, data.mqtt.key_path);
         // Serial gateways
         renderGateways(data.serial_gateways || []);
         // Rules
@@ -587,15 +695,12 @@ function collectConfig() {
     // TLS
     if (tlsToggle.checked) {
         mqtt.tls_version = document.getElementById('mqtt-tls_version').value;
-        const caVal = caSelect.value;
-        mqtt.ca_cert_path = (caVal === 'custom')
-            ? document.getElementById('mqtt-ca_cert_path_custom').value
-            : caVal;
+        mqtt.ca_cert_path = caSelect.value;
         const verify = document.getElementById('mqtt-verify_ca_cert').value;
         if (verify) mqtt.verify_ca_cert = verify;
         if (clientCertToggle.checked) {
-            const cert = document.getElementById('mqtt-cert_path').value;
-            const key = document.getElementById('mqtt-key_path').value;
+            const cert = certSelect.value;
+            const key = keySelect.value;
             if (cert) mqtt.cert_path = cert;
             if (key) mqtt.key_path = key;
         }

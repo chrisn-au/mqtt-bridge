@@ -159,6 +159,37 @@ The web interface at `http://mqtt-bridge.local:8080` provides:
 - **Serial gateway management** -- add/remove/configure serial ports (device, baudrate, parity, data/stop bits)
 - **Security rules** -- IP filtering rules for TCP Modbus requests
 - **Service control** -- save config and restart openmmg with one click
+- **Certificate upload** -- drag-and-drop TLS certificates directly through the browser
+
+## TLS / MQTTS
+
+The web UI auto-enables TLS when port 8883 is set. For standard MQTTS brokers, the system CA bundle is selected by default -- no extra configuration needed.
+
+### AWS IoT Core
+
+AWS IoT Core uses mutual TLS (client certificate authentication) instead of username/password. To set it up:
+
+1. Create a Thing in the AWS IoT Console and download the three certificate files
+2. Open the web UI and go to the MQTT tab
+3. Set **Host** to your endpoint (e.g., `a1b2c3d4e5f6g7.iot.ap-southeast-2.amazonaws.com`)
+4. Set **Port** to `8883` (TLS will auto-enable)
+5. Upload all three certificate files using the drag-and-drop area:
+   - `AmazonRootCA1.pem` -- select this as the **CA Certificate**
+   - `<thing>-certificate.pem.crt` -- select this as the **Client Certificate**
+   - `<thing>-private.pem.key` -- select this as the **Client Key**
+6. Enable **Use client certificate (mutual TLS)**
+7. Set **Client ID** to match your IoT Thing name
+8. Leave **Username** and **Password** empty
+9. Click **Save & Restart**
+
+### Other MQTTS Brokers
+
+For standard MQTTS brokers (HiveMQ, EMQX, Mosquitto with TLS, etc.):
+
+1. Set port to `8883`
+2. CA Certificate defaults to the system bundle -- this works for any broker with a publicly signed certificate
+3. Set username/password as usual
+4. No client certificate needed unless the broker requires mutual TLS
 
 ## Configuration Reference
 
