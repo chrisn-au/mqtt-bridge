@@ -45,6 +45,23 @@ sudo apt-get install -y mosquitto mosquitto-clients
 
 See [MQTT Bridge protocol](#mqtt-bridge) below for the request/response format.
 
+### Query Tool (ES Inverters)
+
+Once the bridge is running, use `goodwe-query.sh` to read/write inverter registers via MQTT. It reads broker settings from `goodwe.json` automatically.
+
+```bash
+./goodwe-query.sh              # Read all ES register groups
+./goodwe-query.sh pv           # PV solar panel data
+./goodwe-query.sh battery      # Battery status
+./goodwe-query.sh grid         # Grid and load data
+./goodwe-query.sh energy       # Energy totals (today / lifetime)
+./goodwe-query.sh settings     # Inverter configuration
+./goodwe-query.sh eco          # Eco mode schedules
+./goodwe-query.sh write 45052 5000  # Set grid export limit to 5000W
+```
+
+Requires `mosquitto_pub`/`mosquitto_sub` (`brew install mosquitto` on Mac) and either `jq` or `python3` to parse the config.
+
 ---
 
 ## Pi Setup (full Modbus gateway + web UI)
@@ -354,23 +371,6 @@ mosquitto_pub -t "goodwe/request" -m "12346 1 6 47511 1"
 ```
 
 The `mqtt` section is optional. When present, it takes priority over the openmmg.conf settings. Set `tls` to `true` for MQTTS connections (port 8883). Leave `ca_cert` empty to use the system CA bundle, which works with any broker using a publicly signed certificate.
-
-### Query Tool (ES Inverters)
-
-`goodwe-query.sh` is a standalone script that publishes register read/write requests via MQTT. It reads broker settings from `goodwe.json` automatically.
-
-```bash
-./goodwe-query.sh              # Read all ES register groups
-./goodwe-query.sh pv           # PV solar panel data
-./goodwe-query.sh battery      # Battery status
-./goodwe-query.sh grid         # Grid and load data
-./goodwe-query.sh energy       # Energy totals (today / lifetime)
-./goodwe-query.sh settings     # Inverter configuration
-./goodwe-query.sh eco          # Eco mode schedules
-./goodwe-query.sh write 45052 5000  # Set grid export limit to 5000W
-```
-
-Requires `mosquitto_pub`/`mosquitto_sub` and either `jq` or `python3` to parse the config.
 
 ### Web API Endpoints
 
