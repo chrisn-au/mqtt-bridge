@@ -1,8 +1,16 @@
 {
   "inverters": [
-    {"id": "0", "name": "My Inverter", "host": "192.168.1.100", "port": 8899}
+    {"id": "0", "name": "My Inverter", "host": "INVERTER_IP_HERE", "port": 8899}
   ],
   "poll_interval": 30,
   "request_topic": "goodwe/request",
-  "response_topic": "goodwe/response"
+  "response_topic": "goodwe/response",
+  "mqtt": {
+    "host": "127.0.0.1",
+    "port": 1883,
+    "username": "",
+    "password": "",
+    "tls": false,
+    "ca_cert": ""
+  }
 }

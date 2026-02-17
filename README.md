@@ -25,10 +25,12 @@ cd mqtt-bridge
 ./setup-goodwe.sh
 ```
 
-Edit `goodwe.json` with your inverter's IP address, then run:
+The setup wizard will ask for your inverter IP, MQTT broker details (host, port, username/password), and TLS settings. It writes `goodwe.json` and installs dependencies automatically.
+
+Then run:
 
 ```bash
-.venv/bin/python goodwe_mqtt.py -c goodwe.json --mqtt-host 127.0.0.1
+.venv/bin/python goodwe_mqtt.py -c goodwe.json
 ```
 
 If you don't have an MQTT broker yet:
@@ -330,7 +332,7 @@ mosquitto_pub -t "goodwe/request" -m "12346 1 6 47511 1"
 
 ### GoodWe Config File
 
-`/etc/openmmg/goodwe.json`:
+`/etc/openmmg/goodwe.json` (or `goodwe.json` in standalone mode):
 ```json
 {
   "inverters": [
@@ -339,9 +341,19 @@ mosquitto_pub -t "goodwe/request" -m "12346 1 6 47511 1"
   ],
   "poll_interval": 30,
   "request_topic": "goodwe/request",
-  "response_topic": "goodwe/response"
+  "response_topic": "goodwe/response",
+  "mqtt": {
+    "host": "broker.example.com",
+    "port": 8883,
+    "username": "myuser",
+    "password": "mypassword",
+    "tls": true,
+    "ca_cert": ""
+  }
 }
 ```
+
+The `mqtt` section is optional. When present, it takes priority over the openmmg.conf settings. Set `tls` to `true` for MQTTS connections (port 8883). Leave `ca_cert` empty to use the system CA bundle, which works with any broker using a publicly signed certificate.
 
 ### Web API Endpoints
 

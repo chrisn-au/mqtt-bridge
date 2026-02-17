@@ -72,8 +72,34 @@ def load_goodwe_config():
 
 
 def load_mqtt_config():
-    """Load MQTT broker config from openmmg config file."""
+    """Load MQTT broker config.
+
+    Checks goodwe.json 'mqtt' section first (standalone mode),
+    then falls back to openmmg.conf (Pi deployment mode).
+    """
     cfg = {"host": "127.0.0.1", "port": "1883"}
+
+    # Try goodwe.json mqtt section first
+    try:
+        with open(GOODWE_CONFIG) as f:
+            gw_cfg = json.load(f)
+        if "mqtt" in gw_cfg:
+            m = gw_cfg["mqtt"]
+            cfg["host"] = m.get("host", cfg["host"])
+            cfg["port"] = str(m.get("port", cfg["port"]))
+            if m.get("username"):
+                cfg["username"] = m["username"]
+            if m.get("password"):
+                cfg["password"] = m["password"]
+            if m.get("tls"):
+                cfg["tls"] = True
+            if m.get("ca_cert"):
+                cfg["ca_cert"] = m["ca_cert"]
+            return cfg
+    except (FileNotFoundError, json.JSONDecodeError, KeyError):
+        pass
+
+    # Fall back to openmmg.conf
     try:
         with open(OPENMMG_CONFIG) as f:
             in_mqtt = False
@@ -132,15 +158,17 @@ class GoodWeBridge:
         if username:
             self.client.username_pw_set(username, password or "")
 
-        tls_version = self.mqtt_config.get("tls_version")
-        if tls_version:
-            ca = self.mqtt_config.get(
-                "ca_cert_path", "/etc/ssl/certs/ca-certificates.crt"
+        use_tls = self.mqtt_config.get("tls") or self.mqtt_config.get("tls_version")
+        if use_tls:
+            ca = (
+                self.mqtt_config.get("ca_cert")
+                or self.mqtt_config.get("ca_cert_path")
+                or None
             )
             cert = self.mqtt_config.get("cert_path")
             key = self.mqtt_config.get("key_path")
             self.client.tls_set(
-                ca_certs=ca,
+                ca_certs=ca if ca else None,
                 certfile=cert if cert else None,
                 keyfile=key if key else None,
             )
@@ -152,7 +180,8 @@ class GoodWeBridge:
 
         host = self.mqtt_config.get("host", "127.0.0.1")
         port = int(self.mqtt_config.get("port", 1883))
-        log.info("Connecting to MQTT broker %s:%d", host, port)
+        tls_label = " (TLS)" if use_tls else ""
+        log.info("Connecting to MQTT broker %s:%d%s", host, port, tls_label)
         self.client.connect(host, port, keepalive=60)
         self.client.loop_start()
 
