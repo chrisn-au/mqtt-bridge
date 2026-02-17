@@ -37,8 +37,8 @@ except ImportError:
     print("ERROR: goodwe not installed. Run: pip install goodwe", file=sys.stderr)
     sys.exit(1)
 
-GOODWE_CONFIG = "/etc/openmmg/goodwe.json"
-OPENMMG_CONFIG = "/etc/openmmg/openmmg.conf"
+GOODWE_CONFIG = os.environ.get("GOODWE_CONFIG", "/etc/openmmg/goodwe.json")
+OPENMMG_CONFIG = os.environ.get("OPENMMG_CONFIG", "/etc/openmmg/openmmg.conf")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -402,4 +402,22 @@ class GoodWeBridge:
 
 
 if __name__ == "__main__":
-    GoodWeBridge().run()
+    import argparse
+
+    parser = argparse.ArgumentParser(description="GoodWe Solar Inverter MQTT Bridge")
+    parser.add_argument("-c", "--config", help="Path to goodwe.json config file")
+    parser.add_argument("--mqtt-host", help="MQTT broker host (overrides openmmg config)")
+    parser.add_argument("--mqtt-port", type=int, help="MQTT broker port (overrides openmmg config)")
+    args = parser.parse_args()
+
+    if args.config:
+        GOODWE_CONFIG = args.config
+
+    bridge = GoodWeBridge()
+
+    if args.mqtt_host:
+        bridge.mqtt_config["host"] = args.mqtt_host
+    if args.mqtt_port:
+        bridge.mqtt_config["port"] = str(args.mqtt_port)
+
+    bridge.run()

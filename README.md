@@ -15,7 +15,37 @@ MQTT Broker                    Raspberry Pi                    Modbus Devices
     │                          └────────────┘
 ```
 
-## Pi Setup
+## Quick Start (GoodWe only -- Mac / Linux / Pi)
+
+No compilation needed. Just Python 3.9+ and an MQTT broker.
+
+```bash
+git clone https://github.com/chrisn-au/mqtt-bridge.git
+cd mqtt-bridge
+./setup-goodwe.sh
+```
+
+Edit `goodwe.json` with your inverter's IP address, then run:
+
+```bash
+.venv/bin/python goodwe_mqtt.py -c goodwe.json --mqtt-host 127.0.0.1
+```
+
+If you don't have an MQTT broker yet:
+
+```bash
+# macOS
+brew install mosquitto && brew services start mosquitto
+
+# Debian/Ubuntu/Pi
+sudo apt-get install -y mosquitto mosquitto-clients
+```
+
+See [MQTT Bridge protocol](#mqtt-bridge) below for the request/response format.
+
+---
+
+## Pi Setup (full Modbus gateway + web UI)
 
 ### 1. Flash Raspberry Pi OS
 
