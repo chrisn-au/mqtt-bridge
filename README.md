@@ -355,6 +355,23 @@ mosquitto_pub -t "goodwe/request" -m "12346 1 6 47511 1"
 
 The `mqtt` section is optional. When present, it takes priority over the openmmg.conf settings. Set `tls` to `true` for MQTTS connections (port 8883). Leave `ca_cert` empty to use the system CA bundle, which works with any broker using a publicly signed certificate.
 
+### Query Tool (ES Inverters)
+
+`goodwe-query.sh` is a standalone script that publishes register read/write requests via MQTT. It reads broker settings from `goodwe.json` automatically.
+
+```bash
+./goodwe-query.sh              # Read all ES register groups
+./goodwe-query.sh pv           # PV solar panel data
+./goodwe-query.sh battery      # Battery status
+./goodwe-query.sh grid         # Grid and load data
+./goodwe-query.sh energy       # Energy totals (today / lifetime)
+./goodwe-query.sh settings     # Inverter configuration
+./goodwe-query.sh eco          # Eco mode schedules
+./goodwe-query.sh write 45052 5000  # Set grid export limit to 5000W
+```
+
+Requires `mosquitto_pub`/`mosquitto_sub` and either `jq` or `python3` to parse the config.
+
 ### Web API Endpoints
 
 | Endpoint | Method | Description |
@@ -507,6 +524,7 @@ The port will appear as `/dev/ttySC0`.
 |------|-------------|
 | `web/app.py` | Flask web management UI (includes GoodWe integration) |
 | `goodwe_mqtt.py` | GoodWe inverter MQTT bridge daemon |
+| `goodwe-query.sh` | ES inverter query/write tool (uses MQTT) |
 | `build_openmmg.sh` | Automated build script for the Pi |
 | `modbus_server.py` | Simulated Modbus server for testing |
 | `modbus_client.py` | Modbus client for testing |
