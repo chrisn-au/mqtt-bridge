@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
 """GoodWe Solar Inverter MQTT Bridge.
 
-Bridges GoodWe inverter data to MQTT, providing:
+Bridges one or more GoodWe inverters to MQTT, providing:
 - Periodic polling of inverter registers (auto-publish)
 - On-demand register read/write via MQTT request/response
 
 Request format (on request topic):
-    <COOKIE> <FUNC> <REG> <COUNT> [DATA...]
+    <COOKIE> <INVERTER_ID> <FUNC> <REG> <COUNT> [DATA...]
 
 Response format (on response topic):
     <COOKIE> OK <val1> <val2> ...
     <COOKIE> ERR <message>
 
-Auto-poll responses use cookie format: poll_<seq>_<start_reg>
+Auto-poll responses use cookie format: poll_<seq>_<inverter_id>_<start_reg>
 """
 
 import asyncio
@@ -51,8 +51,7 @@ log = logging.getLogger("goodwe-mqtt")
 def load_goodwe_config():
     """Load GoodWe bridge configuration."""
     defaults = {
-        "host": "",
-        "port": 8899,
+        "inverters": [],
         "poll_interval": 30,
         "request_topic": "goodwe/request",
         "response_topic": "goodwe/response",
@@ -60,7 +59,13 @@ def load_goodwe_config():
     try:
         with open(GOODWE_CONFIG) as f:
             cfg = json.load(f)
-        defaults.update(cfg)
+        # Migrate single-inverter config to multi format
+        if "host" in cfg and "inverters" not in cfg:
+            if cfg["host"]:
+                cfg["inverters"] = [{"id": "0", "host": cfg["host"], "port": cfg.get("port", 8899)}]
+            else:
+                cfg["inverters"] = []
+        defaults.update({k: cfg[k] for k in defaults if k in cfg})
     except (FileNotFoundError, json.JSONDecodeError):
         pass
     return defaults
@@ -90,7 +95,7 @@ def load_mqtt_config():
 
 
 class GoodWeBridge:
-    """Bridges GoodWe inverter to MQTT."""
+    """Bridges multiple GoodWe inverters to MQTT."""
 
     def __init__(self):
         self.running = True
@@ -99,7 +104,15 @@ class GoodWeBridge:
         self.client = None
         self.lock = threading.Lock()
         self.poll_seq = 0
-        self._poll_ranges = None
+        # Per-inverter cache: {inverter_id: [(start_reg, count), ...]}
+        self._poll_ranges = {}
+
+    def _get_inverter(self, inverter_id):
+        """Look up inverter config by ID."""
+        for inv in self.gw_config["inverters"]:
+            if str(inv.get("id", "")) == str(inverter_id):
+                return inv
+        return None
 
     def setup_mqtt(self):
         """Set up and connect MQTT client."""
@@ -175,37 +188,43 @@ class GoodWeBridge:
     async def _handle_request(self, payload):
         """Parse and execute a register read/write request."""
         parts = payload.split()
-        if len(parts) < 4:
+        if len(parts) < 5:
             cookie = parts[0] if parts else "0"
-            return f"{cookie} ERR invalid format: need COOKIE FUNC REG COUNT"
+            return f"{cookie} ERR invalid format: need COOKIE INVERTER_ID FUNC REG COUNT"
 
         cookie = parts[0]
+        inverter_id = parts[1]
+
         try:
-            func = int(parts[1])
-            reg = int(parts[2])
-            count = int(parts[3])
+            func = int(parts[2])
+            reg = int(parts[3])
+            count = int(parts[4])
         except ValueError:
             return f"{cookie} ERR invalid numeric values"
 
-        host = self.gw_config["host"]
-        port = self.gw_config["port"]
+        inv_cfg = self._get_inverter(inverter_id)
+        if not inv_cfg:
+            return f"{cookie} ERR unknown inverter id '{inverter_id}'"
+
+        host = inv_cfg.get("host", "")
+        port = int(inv_cfg.get("port", 8899))
         if not host:
-            return f"{cookie} ERR inverter not configured"
+            return f"{cookie} ERR inverter {inverter_id} has no host configured"
 
         inverter = await goodwe.connect(host, port=port)
 
         if func in (3, 4):
             return await self._read_registers(inverter, cookie, reg, count)
         elif func == 6:
-            if len(parts) < 5:
+            if len(parts) < 6:
                 return f"{cookie} ERR missing write value"
-            value = int(parts[4])
+            value = int(parts[5])
             return await self._write_register(inverter, cookie, reg, value)
         elif func == 16:
-            if len(parts) < 5:
+            if len(parts) < 6:
                 return f"{cookie} ERR missing write values"
             data = bytes()
-            for v in parts[4:]:
+            for v in parts[5:]:
                 data += int(v).to_bytes(2, "big")
             return await self._write_multi(inverter, cookie, reg, data)
         else:
@@ -278,35 +297,35 @@ class GoodWeBridge:
 
         return final
 
-    async def _poll(self):
-        """Poll all register ranges and publish results."""
-        host = self.gw_config["host"]
-        port = self.gw_config["port"]
+    async def _poll_inverter(self, inv_cfg):
+        """Poll one inverter's register ranges."""
+        inv_id = str(inv_cfg.get("id", "0"))
+        host = inv_cfg.get("host", "")
+        port = int(inv_cfg.get("port", 8899))
+        name = inv_cfg.get("name", host)
+
         if not host:
             return
 
         try:
             inverter = await goodwe.connect(host, port=port)
 
-            if self._poll_ranges is None:
-                self._poll_ranges = await self._discover_ranges(inverter)
-                if self._poll_ranges:
+            if inv_id not in self._poll_ranges:
+                ranges = await self._discover_ranges(inverter)
+                self._poll_ranges[inv_id] = ranges
+                if ranges:
                     log.info(
-                        "Discovered %d register ranges: %s",
-                        len(self._poll_ranges),
-                        ", ".join(
-                            f"{s}-{s + c - 1}" for s, c in self._poll_ranges
-                        ),
+                        "Inverter %s (%s): %d register ranges: %s",
+                        inv_id, name, len(ranges),
+                        ", ".join(f"{s}-{s + c - 1}" for s, c in ranges),
                     )
                 else:
-                    log.warning("No sensor registers found")
+                    log.warning("Inverter %s (%s): no sensor registers found", inv_id, name)
                     return
 
-            self.poll_seq += 1
-
-            for reg_start, count in self._poll_ranges:
+            for reg_start, count in self._poll_ranges[inv_id]:
                 try:
-                    cookie = f"poll_{self.poll_seq}_{reg_start}"
+                    cookie = f"poll_{self.poll_seq}_{inv_id}_{reg_start}"
                     result = await self._read_registers(
                         inverter, cookie, reg_start, count
                     )
@@ -315,15 +334,19 @@ class GoodWeBridge:
                     )
                 except Exception as e:
                     log.warning(
-                        "Poll %d-%d failed: %s",
-                        reg_start,
-                        reg_start + count - 1,
-                        e,
+                        "Inverter %s poll %d-%d failed: %s",
+                        inv_id, reg_start, reg_start + count - 1, e,
                     )
 
         except Exception as e:
-            log.error("Poll failed: %s", e)
-            self._poll_ranges = None  # Reset cache on connection failure
+            log.error("Inverter %s (%s) poll failed: %s", inv_id, name, e)
+            self._poll_ranges.pop(inv_id, None)  # Reset cache on failure
+
+    async def _poll_all(self):
+        """Poll all configured inverters."""
+        self.poll_seq += 1
+        for inv_cfg in self.gw_config["inverters"]:
+            await self._poll_inverter(inv_cfg)
 
     def run(self):
         """Main run loop."""
@@ -334,20 +357,25 @@ class GoodWeBridge:
             signal.SIGINT, lambda *_: setattr(self, "running", False)
         )
 
-        if not self.gw_config["host"]:
+        inverters = self.gw_config["inverters"]
+        if not inverters:
             log.warning(
-                "No inverter host configured - set via web UI or %s",
+                "No inverters configured - set via web UI or %s",
                 GOODWE_CONFIG,
             )
 
         self.setup_mqtt()
 
         log.info("GoodWe MQTT bridge started")
-        log.info(
-            "  Inverter: %s:%s",
-            self.gw_config["host"] or "(not set)",
-            self.gw_config["port"],
-        )
+        log.info("  Inverters: %d configured", len(inverters))
+        for inv in inverters:
+            log.info(
+                "    [%s] %s (%s:%s)",
+                inv.get("id", "?"),
+                inv.get("name", ""),
+                inv.get("host", "?"),
+                inv.get("port", 8899),
+            )
         log.info("  Request topic:  %s", self.gw_config["request_topic"])
         log.info("  Response topic: %s", self.gw_config["response_topic"])
         log.info("  Poll interval:  %ds", self.gw_config["poll_interval"])
@@ -355,10 +383,10 @@ class GoodWeBridge:
         interval = max(int(self.gw_config["poll_interval"]), 5)
 
         while self.running:
-            if self.gw_config["host"] and interval > 0:
+            if inverters and interval > 0:
                 with self.lock:
                     try:
-                        asyncio.run(self._poll())
+                        asyncio.run(self._poll_all())
                     except Exception as e:
                         log.error("Poll error: %s", e)
 

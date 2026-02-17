@@ -264,12 +264,13 @@ The `goodwe-mqtt` daemon bridges inverter register data to MQTT. It reads MQTT b
 
 **Request format** (publish to `goodwe/request`):
 ```
-<COOKIE> <FUNC> <REG> <COUNT> [DATA...]
+<COOKIE> <INVERTER_ID> <FUNC> <REG> <COUNT> [DATA...]
 ```
 
 | Field | Description |
 |-------|-------------|
 | Cookie | Unique ID to match request/response |
+| Inverter ID | Matches `id` in inverter config (e.g., `0`, `1`) |
 | Func | Modbus function: 3 (read holding), 4 (read input), 6 (write single), 16 (write multi) |
 | Reg | Starting register address (e.g., 35100) |
 | Count | Number of registers to read |
@@ -281,19 +282,19 @@ The `goodwe-mqtt` daemon bridges inverter register data to MQTT. It reads MQTT b
 <COOKIE> ERR <message>
 ```
 
-**Auto-polling** reads all inverter register ranges every N seconds (configurable). Poll responses use cookies like `poll_<seq>_<start_reg>`.
+**Auto-polling** reads all inverter register ranges every N seconds (configurable). Poll responses use cookies like `poll_<seq>_<inverter_id>_<start_reg>`.
 
 **Examples:**
 ```bash
 # Subscribe for responses
 mosquitto_sub -t "goodwe/response" &
 
-# Read 10 registers starting at 35100 (PV runtime data)
-mosquitto_pub -t "goodwe/request" -m "12345 3 35100 10"
+# Read 10 registers from inverter 0 starting at 35100 (PV runtime data)
+mosquitto_pub -t "goodwe/request" -m "12345 0 3 35100 10"
 # Response: 12345 OK 3200 85 2720 0 3150 82 2583 0 5303 0
 
-# Write value 1 to register 47511 (set operation mode)
-mosquitto_pub -t "goodwe/request" -m "12346 6 47511 1"
+# Write value 1 to register 47511 on inverter 1 (set operation mode)
+mosquitto_pub -t "goodwe/request" -m "12346 1 6 47511 1"
 # Response: 12346 OK
 ```
 
@@ -302,8 +303,10 @@ mosquitto_pub -t "goodwe/request" -m "12346 6 47511 1"
 `/etc/openmmg/goodwe.json`:
 ```json
 {
-  "host": "192.168.1.100",
-  "port": 8899,
+  "inverters": [
+    {"id": "0", "name": "Roof East", "host": "192.168.1.100", "port": 8899},
+    {"id": "1", "name": "Roof West", "host": "192.168.1.101", "port": 8899}
+  ],
   "poll_interval": 30,
   "request_topic": "goodwe/request",
   "response_topic": "goodwe/response"

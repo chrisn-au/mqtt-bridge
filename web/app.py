@@ -153,12 +153,21 @@ def validate_config(config):
 def load_goodwe_config():
     """Load GoodWe inverter configuration."""
     defaults = {
-        "host": "", "port": 8899, "poll_interval": 30,
-        "request_topic": "goodwe/request", "response_topic": "goodwe/response",
+        "inverters": [],
+        "poll_interval": 30,
+        "request_topic": "goodwe/request",
+        "response_topic": "goodwe/response",
     }
     try:
         with open(GOODWE_CONFIG_PATH) as f:
-            defaults.update(json.load(f))
+            cfg = json.load(f)
+        # Migrate single-inverter config to multi format
+        if "host" in cfg and "inverters" not in cfg:
+            if cfg["host"]:
+                cfg["inverters"] = [{"id": "0", "host": cfg["host"], "port": cfg.get("port", 8899)}]
+            else:
+                cfg["inverters"] = []
+        defaults.update({k: cfg[k] for k in defaults if k in cfg})
     except (FileNotFoundError, json.JSONDecodeError):
         pass
     return defaults
@@ -356,12 +365,19 @@ def api_save_goodwe_config():
     data = request.get_json()
     if not data:
         return jsonify({"error": "Invalid JSON"}), 400
-    host = (data.get("host") or "").strip()
-    port = int(data.get("port", 8899))
+    inverters = []
+    for inv in data.get("inverters", []):
+        host = (inv.get("host") or "").strip()
+        entry = {
+            "id": str(inv.get("id", len(inverters))).strip(),
+            "name": (inv.get("name") or "").strip(),
+            "host": host,
+            "port": int(inv.get("port", 8899)),
+        }
+        inverters.append(entry)
     poll_interval = int(data.get("poll_interval", 30))
     config = {
-        "host": host,
-        "port": port,
+        "inverters": inverters,
         "poll_interval": max(poll_interval, 5) if poll_interval > 0 else 0,
         "request_topic": data.get("request_topic", "goodwe/request").strip(),
         "response_topic": data.get("response_topic", "goodwe/response").strip(),
@@ -384,15 +400,34 @@ def api_goodwe_data():
     if not GOODWE_AVAILABLE:
         return jsonify({"error": "goodwe library not installed"}), 500
     cfg = load_goodwe_config()
-    if not cfg.get("host"):
+    inverters = cfg.get("inverters", [])
+    if not inverters:
         return jsonify({"error": "not_configured"}), 400
-    try:
-        data = asyncio.run(
-            _read_goodwe_data(cfg["host"], cfg.get("port", 8899))
-        )
-        return jsonify(data)
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    inv_id = request.args.get("id")
+    if inv_id is not None:
+        inv = next((i for i in inverters if str(i.get("id")) == inv_id), None)
+        if not inv or not inv.get("host"):
+            return jsonify({"error": f"inverter {inv_id} not found"}), 400
+        try:
+            data = asyncio.run(_read_goodwe_data(inv["host"], inv.get("port", 8899)))
+            data["inverter_id"] = inv_id
+            data["inverter_name"] = inv.get("name", "")
+            return jsonify(data)
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+    # Return data for all inverters
+    results = []
+    for inv in inverters:
+        if not inv.get("host"):
+            continue
+        try:
+            data = asyncio.run(_read_goodwe_data(inv["host"], inv.get("port", 8899)))
+            data["inverter_id"] = inv.get("id", "")
+            data["inverter_name"] = inv.get("name", "")
+            results.append(data)
+        except Exception as e:
+            results.append({"inverter_id": inv.get("id", ""), "inverter_name": inv.get("name", ""), "error": str(e)})
+    return jsonify(results)
 
 
 # ---------------------------------------------------------------------------
@@ -657,15 +692,11 @@ btn, .btn { display: inline-block; padding: 0.5rem 1rem; border: none; border-ra
 
         <!-- Inverter Config -->
         <div class="tab-content" id="tab-inverter">
-            <h2>GoodWe Inverter</h2>
-            <p style="font-size:0.85rem;color:var(--muted);margin-bottom:1rem">
-                Connect to a GoodWe solar inverter on your local network via its WiFi/LAN dongle.
-                The MQTT bridge daemon publishes register data to MQTT topics.
-            </p>
-            <div class="form-row">
-                <div><label>Inverter IP Address</label><input type="text" id="gw-host" placeholder="e.g. 192.168.1.100"></div>
-                <div><label>Port</label><input type="text" id="gw-port" value="8899" placeholder="8899"></div>
+            <div class="section-header">
+                <h2>GoodWe Inverters</h2>
+                <button class="btn btn-outline btn-sm" onclick="addInverter()">+ Add Inverter</button>
             </div>
+            <div id="inverters-list"></div>
             <h3 style="margin-top:1rem;margin-bottom:0.5rem;font-size:0.9rem;color:var(--muted)">MQTT Bridge</h3>
             <div class="form-row">
                 <div><label>Request Topic</label><input type="text" id="gw-request-topic" value="goodwe/request"></div>
@@ -677,7 +708,6 @@ btn, .btn { display: inline-block; padding: 0.5rem 1rem; border: none; border-ra
             </div>
             <div class="actions">
                 <button class="btn btn-solar" onclick="saveInverterConfig()">Save Inverter Config</button>
-                <button class="btn btn-outline" onclick="testInverter()">Test Connection</button>
             </div>
             <div id="inverter-test-result" style="margin-top:0.75rem"></div>
         </div>
@@ -1031,10 +1061,51 @@ const KIND_LABELS = {
 };
 const KIND_ORDER = ['PV', 'BAT', 'GRID', 'AC', 'UPS', 'BMS'];
 
+// --- Inverter config ---
+let invCounter = 0;
+function invHtml(inv, idx) {
+    return `<div class="gw-block" data-inv="${idx}">
+        <button class="remove-btn" onclick="this.parentElement.remove()">&times;</button>
+        <div class="form-row-3">
+            <div><label>ID</label><input type="text" class="inv-id" value="${inv.id || ''}"></div>
+            <div><label>Name</label><input type="text" class="inv-name" value="${inv.name || ''}" placeholder="e.g. Roof East"></div>
+            <div><label>Port</label><input type="text" class="inv-port" value="${inv.port || '8899'}"></div>
+        </div>
+        <div class="form-row">
+            <div><label>IP Address</label><input type="text" class="inv-host" value="${inv.host || ''}" placeholder="e.g. 192.168.1.100"></div>
+            <div style="display:flex;align-items:end;padding-bottom:0.75rem">
+                <button class="btn btn-outline btn-sm" onclick="testSingleInverter(this)">Test Connection</button>
+                <span class="inv-test-result" style="margin-left:0.5rem;font-size:0.85rem"></span>
+            </div>
+        </div>
+    </div>`;
+}
+
+function renderInverters(invs) {
+    document.getElementById('inverters-list').innerHTML = invs.map((g, i) => invHtml(g, i)).join('');
+}
+
+function addInverter() {
+    document.getElementById('inverters-list').insertAdjacentHTML('beforeend',
+        invHtml({id: String(document.querySelectorAll('.gw-block[data-inv]').length)}, invCounter++));
+}
+
+function collectInverters() {
+    const invs = [];
+    document.querySelectorAll('.gw-block[data-inv]').forEach(el => {
+        const inv = {};
+        ['id','name','host','port'].forEach(f => {
+            const inp = el.querySelector('.inv-' + f);
+            if (inp && inp.value) inv[f] = inp.value;
+        });
+        invs.push(inv);
+    });
+    return invs;
+}
+
 function loadInverterConfig() {
     fetch('/api/goodwe/config').then(r => r.json()).then(data => {
-        document.getElementById('gw-host').value = data.host || '';
-        document.getElementById('gw-port').value = data.port || 8899;
+        renderInverters(data.inverters || []);
         document.getElementById('gw-request-topic').value = data.request_topic || 'goodwe/request';
         document.getElementById('gw-response-topic').value = data.response_topic || 'goodwe/response';
         document.getElementById('gw-poll-interval').value = data.poll_interval || 30;
@@ -1042,8 +1113,6 @@ function loadInverterConfig() {
 }
 
 function saveInverterConfig() {
-    const host = document.getElementById('gw-host').value.trim();
-    const port = document.getElementById('gw-port').value.trim() || '8899';
     const reqTopic = document.getElementById('gw-request-topic').value.trim() || 'goodwe/request';
     const resTopic = document.getElementById('gw-response-topic').value.trim() || 'goodwe/response';
     const pollInterval = document.getElementById('gw-poll-interval').value.trim() || '30';
@@ -1051,47 +1120,47 @@ function saveInverterConfig() {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({
-            host: host, port: parseInt(port),
+            inverters: collectInverters(),
             request_topic: reqTopic, response_topic: resTopic,
             poll_interval: parseInt(pollInterval)
         })
     }).then(r => r.json()).then(data => {
         if (data.ok) {
-            showToast('Inverter config saved', 'success');
+            showToast(data.message || 'Saved', 'success');
             refreshSolar();
+            setTimeout(refreshStatus, 2000);
         } else {
             showToast('Error: ' + data.error, 'error');
         }
     }).catch(() => showToast('Save failed', 'error'));
 }
 
-function testInverter() {
-    const resultEl = document.getElementById('inverter-test-result');
-    resultEl.innerHTML = '<span style="color:var(--muted)">Connecting...</span>';
-    // Save first, then test
-    const host = document.getElementById('gw-host').value.trim();
-    const port = document.getElementById('gw-port').value.trim() || '8899';
+function testSingleInverter(btn) {
+    const block = btn.closest('.gw-block');
+    const resultEl = block.querySelector('.inv-test-result');
+    const host = block.querySelector('.inv-host').value.trim();
+    const port = block.querySelector('.inv-port').value.trim() || '8899';
+    const id = block.querySelector('.inv-id').value.trim();
     if (!host) {
-        resultEl.innerHTML = '<span style="color:var(--danger)">Enter an IP address first</span>';
+        resultEl.innerHTML = '<span style="color:var(--danger)">Enter IP first</span>';
         return;
     }
-    fetch('/api/goodwe/config', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({host: host, port: parseInt(port)})
-    }).then(() => fetch('/api/goodwe/data')).then(r => r.json()).then(data => {
-        if (data.error) {
-            resultEl.innerHTML = '<span style="color:var(--danger)">Connection failed: ' +
-                data.error + '</span>';
-        } else {
-            const info = data.info || {};
-            resultEl.innerHTML = '<span style="color:var(--success)">Connected! ' +
-                (info.model || 'Unknown model') + ' (Serial: ' + (info.serial || 'N/A') + ')</span>';
-            refreshSolar();
-        }
-    }).catch(() => {
-        resultEl.innerHTML = '<span style="color:var(--danger)">Connection failed (timeout or network error)</span>';
-    });
+    resultEl.innerHTML = '<span style="color:var(--muted)">Connecting...</span>';
+    // Save config first so the API knows about this inverter, then test
+    saveInverterConfig();
+    setTimeout(() => {
+        fetch('/api/goodwe/data?id=' + encodeURIComponent(id)).then(r => r.json()).then(data => {
+            if (data.error) {
+                resultEl.innerHTML = '<span style="color:var(--danger)">' + data.error + '</span>';
+            } else {
+                const info = data.info || {};
+                resultEl.innerHTML = '<span style="color:var(--success)">' +
+                    (info.model || 'OK') + (info.serial ? ' (' + info.serial + ')' : '') + '</span>';
+            }
+        }).catch(() => {
+            resultEl.innerHTML = '<span style="color:var(--danger)">Failed</span>';
+        });
+    }, 1500);
 }
 
 function refreshSolar() {
@@ -1099,8 +1168,8 @@ function refreshSolar() {
     fetch('/api/goodwe/data').then(r => r.json()).then(data => {
         if (data.error === 'not_configured') {
             el.innerHTML = '<div class="solar-placeholder">' +
-                '<p>No inverter configured</p>' +
-                '<p style="font-size:0.85rem">Set the inverter IP address in the <a href="#" onclick="' +
+                '<p>No inverters configured</p>' +
+                '<p style="font-size:0.85rem">Add inverters in the <a href="#" onclick="' +
                 "document.querySelector('[data-tab=inverter]').click();return false;" +
                 '" style="color:var(--primary)">Inverter</a> config tab below.</p></div>';
             return;
@@ -1110,31 +1179,40 @@ function refreshSolar() {
                 data.error + '</div>';
             return;
         }
-        renderSolarData(data);
+        // data is an array of inverter results
+        const items = Array.isArray(data) ? data : [data];
+        let html = '';
+        items.forEach(inv => {
+            if (inv.error) {
+                const name = inv.inverter_name || inv.inverter_id || '?';
+                html += '<div class="solar-error">Inverter ' + name + ': ' + inv.error + '</div>';
+            } else {
+                html += renderSolarData(inv);
+            }
+        });
+        el.innerHTML = html || '<div class="solar-placeholder"><p>No sensor data available</p></div>';
     }).catch(() => {
         el.innerHTML = '<div class="solar-error">Failed to fetch inverter data</div>';
     });
 }
 
 function renderSolarData(data) {
-    const el = document.getElementById('solar-content');
     let html = '';
 
     // Info bar
     const info = data.info || {};
-    if (info.model || info.serial) {
-        html += '<div class="solar-info">';
-        if (info.model) html += '<strong>' + info.model + '</strong>';
-        if (info.serial) html += ' &middot; Serial: ' + info.serial;
-        if (info.firmware) html += ' &middot; FW: ' + info.firmware;
-        if (info.rated_power) html += ' &middot; ' + (info.rated_power / 1000).toFixed(1) + ' kW';
-        html += '</div>';
-    }
+    const name = data.inverter_name || '';
+    html += '<div class="solar-info">';
+    if (name) html += '<strong>' + name + '</strong> &middot; ';
+    if (info.model) html += '<strong>' + info.model + '</strong>';
+    if (info.serial) html += ' &middot; Serial: ' + info.serial;
+    if (info.firmware) html += ' &middot; FW: ' + info.firmware;
+    if (info.rated_power) html += ' &middot; ' + (info.rated_power / 1000).toFixed(1) + ' kW';
+    html += '</div>';
 
     // Sensor groups
     const sensors = data.sensors || {};
     const sortedKinds = KIND_ORDER.filter(k => sensors[k]);
-    // Add any kinds not in our predefined order
     Object.keys(sensors).forEach(k => { if (!sortedKinds.includes(k)) sortedKinds.push(k); });
 
     sortedKinds.forEach(kind => {
@@ -1145,7 +1223,6 @@ function renderSolarData(data) {
         items.forEach(s => {
             let displayVal = s.value;
             if (typeof displayVal === 'number') {
-                // Format large numbers with commas
                 if (Math.abs(displayVal) >= 1000) {
                     displayVal = displayVal.toLocaleString();
                 }
@@ -1160,10 +1237,7 @@ function renderSolarData(data) {
         html += '</div></div>';
     });
 
-    if (!html) {
-        html = '<div class="solar-placeholder"><p>No sensor data available</p></div>';
-    }
-    el.innerHTML = html;
+    return html;
 }
 
 // --- Init ---
