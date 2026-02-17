@@ -1,0 +1,125 @@
+---
+- name: Configure mqtt-bridge Pi
+  hosts: localhost
+  connection: local
+  become: true
+
+  vars:
+    app_dir: /opt/openmmg-web
+    venv_dir: /opt/openmmg-web/venv
+    repo_dir: "{{ playbook_dir }}/.."
+    pip_packages:
+      - flask
+      - goodwe
+      - paho-mqtt
+
+  tasks:
+    # --- System packages ---
+    - name: Install system packages
+      ansible.builtin.apt:
+        name:
+          - mosquitto
+          - mosquitto-clients
+          - python3-venv
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+
+    # --- Application directory ---
+    - name: Create application directory
+      ansible.builtin.file:
+        path: "{{ app_dir }}"
+        state: directory
+        mode: "0755"
+
+    # --- Python venv ---
+    - name: Create Python venv
+      ansible.builtin.command:
+        cmd: python3 -m venv "{{ venv_dir }}"
+        creates: "{{ venv_dir }}/bin/python"
+
+    - name: Install pip packages
+      ansible.builtin.pip:
+        name: "{{ pip_packages }}"
+        virtualenv: "{{ venv_dir }}"
+        state: present
+
+    # --- Application files ---
+    - name: Deploy app.py
+      ansible.builtin.copy:
+        src: "{{ repo_dir }}/web/app.py"
+        dest: "{{ app_dir }}/app.py"
+        mode: "0644"
+      notify: restart openmmg-web
+
+    - name: Deploy goodwe_mqtt.py
+      ansible.builtin.copy:
+        src: "{{ repo_dir }}/goodwe_mqtt.py"
+        dest: "{{ app_dir }}/goodwe_mqtt.py"
+        mode: "0644"
+      notify: restart goodwe-mqtt
+
+    # --- Systemd unit files ---
+    - name: Deploy openmmg service
+      ansible.builtin.copy:
+        src: files/openmmg.service
+        dest: /etc/systemd/system/openmmg.service
+        mode: "0644"
+      notify:
+        - reload systemd
+        - restart openmmg
+
+    - name: Deploy openmmg-web service
+      ansible.builtin.copy:
+        src: files/openmmg-web.service
+        dest: /etc/systemd/system/openmmg-web.service
+        mode: "0644"
+      notify:
+        - reload systemd
+        - restart openmmg-web
+
+    - name: Deploy goodwe-mqtt service
+      ansible.builtin.copy:
+        src: files/goodwe-mqtt.service
+        dest: /etc/systemd/system/goodwe-mqtt.service
+        mode: "0644"
+      notify:
+        - reload systemd
+        - restart goodwe-mqtt
+
+    # --- Enable services ---
+    - name: Enable services
+      ansible.builtin.systemd:
+        name: "{{ item }}"
+        enabled: true
+      loop:
+        - openmmg
+        - openmmg-web
+        - goodwe-mqtt
+
+    # --- Report status ---
+    - name: Report ansible-pull status to MQTT
+      ansible.builtin.shell: |
+        mosquitto_pub -t 'ansible/status' -m "OK $(date '+%Y-%m-%d %H:%M:%S') - playbook applied successfully"
+      changed_when: false
+      ignore_errors: true
+
+  handlers:
+    - name: reload systemd
+      ansible.builtin.systemd:
+        daemon_reload: true
+
+    - name: restart openmmg
+      ansible.builtin.systemd:
+        name: openmmg
+        state: restarted
+
+    - name: restart openmmg-web
+      ansible.builtin.systemd:
+        name: openmmg-web
+        state: restarted
+
+    - name: restart goodwe-mqtt
+      ansible.builtin.systemd:
+        name: goodwe-mqtt
+        state: restarted

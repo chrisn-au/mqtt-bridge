@@ -85,7 +85,13 @@ def load_mqtt_config():
             gw_cfg = json.load(f)
         if "mqtt" in gw_cfg:
             m = gw_cfg["mqtt"]
-            cfg["host"] = m.get("host", cfg["host"])
+            host = m.get("host", cfg["host"])
+            # Strip protocol prefixes — MQTT uses raw TCP, not HTTP
+            for prefix in ("http://", "https://", "mqtt://", "mqtts://"):
+                if host.startswith(prefix):
+                    host = host[len(prefix):]
+                    break
+            cfg["host"] = host.rstrip("/")
             cfg["port"] = str(m.get("port", cfg["port"]))
             if m.get("username"):
                 cfg["username"] = m["username"]

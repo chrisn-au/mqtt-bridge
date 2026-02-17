@@ -1,0 +1,15 @@
+[Unit]
+Description=openmmg Web Management UI
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/openmmg-web
+ExecStart=/opt/openmmg-web/venv/bin/python /opt/openmmg-web/app.py
+Restart=on-failure
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

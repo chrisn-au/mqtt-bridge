@@ -65,11 +65,11 @@ if [ -n "$MQTT_PASS" ]; then
     MQTT_ARGS="$MQTT_ARGS -P $MQTT_PASS"
 fi
 if [ "$MQTT_TLS" = "true" ]; then
-    if [ -d "/etc/ssl/certs" ]; then
-        MQTT_ARGS="$MQTT_ARGS --capath /etc/ssl/certs"
-    elif [ -f "/etc/ssl/cert.pem" ]; then
+    if [ -f "/etc/ssl/cert.pem" ]; then
         MQTT_ARGS="$MQTT_ARGS --cafile /etc/ssl/cert.pem"
-    else
+    elif [ -d "/etc/ssl/certs" ]; then
+        MQTT_ARGS="$MQTT_ARGS --capath /etc/ssl/certs"
+    elif [ -f "/opt/homebrew/etc/openssl@3/cert.pem" ]; then
         MQTT_ARGS="$MQTT_ARGS --cafile /opt/homebrew/etc/openssl@3/cert.pem"
     fi
 fi

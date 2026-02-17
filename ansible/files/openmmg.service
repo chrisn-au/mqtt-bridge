@@ -1,0 +1,12 @@
+[Unit]
+Description=Open MQTT to Modbus Gateway (openmmg)
+After=network.target mosquitto.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/openmmg -c /etc/openmmg/openmmg.conf
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

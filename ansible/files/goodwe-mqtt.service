@@ -1,0 +1,15 @@
+[Unit]
+Description=GoodWe Solar Inverter MQTT Bridge
+After=network.target mosquitto.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/openmmg-web
+ExecStart=/opt/openmmg-web/venv/bin/python /opt/openmmg-web/goodwe_mqtt.py
+Restart=on-failure
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
