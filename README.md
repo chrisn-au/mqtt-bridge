@@ -1,6 +1,6 @@
 # MQTT Bridge
 
-A Raspberry Pi-based MQTT-to-Modbus gateway using [open-modbusgateway](https://github.com/ganehag/open-modbusgateway) (openmmg). Receives Modbus commands over MQTT, executes them against Modbus TCP or serial RTU targets, and publishes responses back. Includes a web management UI for configuration and monitoring.
+A Raspberry Pi-based MQTT-to-Modbus gateway using [open-modbusgateway](https://github.com/ganehag/open-modbusgateway) (openmmg). Receives Modbus commands over MQTT, executes them against Modbus TCP or serial RTU targets, and publishes responses back. Also integrates with [GoodWe solar inverters](https://github.com/marcelblijleven/goodwe) for live monitoring via WiFi. Includes a web management UI for configuration and monitoring.
 
 ```
 MQTT Broker                    Raspberry Pi                    Modbus Devices
@@ -9,8 +9,9 @@ MQTT Broker                    Raspberry Pi                    Modbus Devices
     │                          │            │ ── /dev/ttyAMA0 ──► Slave 2
     │  modbus/response   ◄───  │  (C binary)│                       │
     │                          └────────────┘                       │
-    │                          │  Web UI    │
-    │                          │  :8080     │
+    │                          ┌────────────┐              GoodWe Inverter
+    │                          │  Web UI    │ ── WiFi/UDP ──► :8899
+    │                          │  :8080     │              (or TCP :502)
     │                          └────────────┘
 ```
 
@@ -112,7 +113,7 @@ sudo systemctl enable --now openmmg
 sudo mkdir -p /opt/openmmg-web
 sudo cp web/app.py /opt/openmmg-web/app.py
 python3 -m venv /opt/openmmg-web/venv
-/opt/openmmg-web/venv/bin/pip install flask
+/opt/openmmg-web/venv/bin/pip install flask goodwe
 ```
 
 Create the web UI service:
@@ -142,7 +143,43 @@ sudo systemctl enable --now openmmg-web
 
 The web UI is now available at **http://mqtt-bridge.local:8080**.
 
-### 8. Serial port permissions
+### 8. Set up the GoodWe MQTT bridge (optional)
+
+If you have a GoodWe solar inverter on the network:
+
+```bash
+sudo cp goodwe_mqtt.py /opt/openmmg-web/goodwe_mqtt.py
+/opt/openmmg-web/venv/bin/pip install paho-mqtt
+```
+
+Create the service:
+
+```bash
+sudo tee /etc/systemd/system/goodwe-mqtt.service << 'EOF'
+[Unit]
+Description=GoodWe Solar Inverter MQTT Bridge
+After=network.target mosquitto.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/openmmg-web
+ExecStart=/opt/openmmg-web/venv/bin/python /opt/openmmg-web/goodwe_mqtt.py
+Restart=on-failure
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now goodwe-mqtt
+```
+
+Configure the inverter IP via the web UI (Inverter tab) or edit `/etc/openmmg/goodwe.json` directly.
+
+### 9. Serial port permissions
 
 If using a USB-to-RS485 adapter, add your user to the `dialout` group:
 
@@ -155,9 +192,11 @@ sudo usermod -a -G dialout chris
 The web interface at `http://mqtt-bridge.local:8080` provides:
 
 - **Status dashboard** -- openmmg and mosquitto service status, Pi uptime/memory/disk, serial port detection, recent logs
+- **Solar inverter dashboard** -- live GoodWe inverter data (PV generation, battery, grid, AC output) with auto-refresh
 - **MQTT configuration** -- host, port, topics, authentication, TLS settings
 - **Serial gateway management** -- add/remove/configure serial ports (device, baudrate, parity, data/stop bits)
 - **Security rules** -- IP filtering rules for TCP Modbus requests
+- **Inverter configuration** -- GoodWe inverter IP/port with connection testing
 - **Service control** -- save config and restart openmmg with one click
 - **Certificate upload** -- drag-and-drop TLS certificates directly through the browser
 
@@ -190,6 +229,94 @@ For standard MQTTS brokers (HiveMQ, EMQX, Mosquitto with TLS, etc.):
 2. CA Certificate defaults to the system bundle -- this works for any broker with a publicly signed certificate
 3. Set username/password as usual
 4. No client certificate needed unless the broker requires mutual TLS
+
+## GoodWe Solar Inverter
+
+The web UI integrates with GoodWe solar inverters via the [goodwe](https://github.com/marcelblijleven/goodwe) Python library. It connects to the inverter's WiFi/LAN dongle over the local network and reads live runtime data.
+
+### Supported Inverters
+
+All GoodWe families: ET, EH, BT, BH, ES, EM, BP, DT, MS, D-NS, XS (and white-label variants).
+
+### Setup
+
+1. Open the web UI and click the **Inverter** config tab
+2. Enter the inverter's IP address on your local network
+3. Port defaults to **8899** (UDP, standard WiFi dongle). Use **502** for the newer V2.0 LAN+WiFi dongle
+4. Click **Test Connection** to verify
+5. Live sensor data will appear on the Solar Inverter dashboard card
+
+### Data Displayed
+
+Sensors are grouped by category (varies by inverter model):
+
+- **Solar Panels** -- PV voltage, current, power per string
+- **Battery** -- state of charge, voltage, current, power, temperature
+- **Grid** -- voltage, frequency, import/export power
+- **AC Output** -- output voltage, current, power
+- **Backup / UPS** -- backup load data (if applicable)
+
+Data auto-refreshes every 30 seconds.
+
+### MQTT Bridge
+
+The `goodwe-mqtt` daemon bridges inverter register data to MQTT. It reads MQTT broker settings from the openmmg config and inverter settings from `/etc/openmmg/goodwe.json`.
+
+**Request format** (publish to `goodwe/request`):
+```
+<COOKIE> <FUNC> <REG> <COUNT> [DATA...]
+```
+
+| Field | Description |
+|-------|-------------|
+| Cookie | Unique ID to match request/response |
+| Func | Modbus function: 3 (read holding), 4 (read input), 6 (write single), 16 (write multi) |
+| Reg | Starting register address (e.g., 35100) |
+| Count | Number of registers to read |
+| Data | Values to write (function 6: one value, function 16: multiple values) |
+
+**Response format** (published to `goodwe/response`):
+```
+<COOKIE> OK <val1> <val2> ...
+<COOKIE> ERR <message>
+```
+
+**Auto-polling** reads all inverter register ranges every N seconds (configurable). Poll responses use cookies like `poll_<seq>_<start_reg>`.
+
+**Examples:**
+```bash
+# Subscribe for responses
+mosquitto_sub -t "goodwe/response" &
+
+# Read 10 registers starting at 35100 (PV runtime data)
+mosquitto_pub -t "goodwe/request" -m "12345 3 35100 10"
+# Response: 12345 OK 3200 85 2720 0 3150 82 2583 0 5303 0
+
+# Write value 1 to register 47511 (set operation mode)
+mosquitto_pub -t "goodwe/request" -m "12346 6 47511 1"
+# Response: 12346 OK
+```
+
+### GoodWe Config File
+
+`/etc/openmmg/goodwe.json`:
+```json
+{
+  "host": "192.168.1.100",
+  "port": 8899,
+  "poll_interval": 30,
+  "request_topic": "goodwe/request",
+  "response_topic": "goodwe/response"
+}
+```
+
+### Web API Endpoints
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/api/goodwe/config` | GET | Current inverter config |
+| `/api/goodwe/config` | POST | Save inverter config (restarts goodwe-mqtt) |
+| `/api/goodwe/data` | GET | Live runtime data from inverter |
 
 ## Configuration Reference
 
@@ -333,7 +460,8 @@ The port will appear as `/dev/ttySC0`.
 
 | File | Description |
 |------|-------------|
-| `web/app.py` | Flask web management UI |
+| `web/app.py` | Flask web management UI (includes GoodWe integration) |
+| `goodwe_mqtt.py` | GoodWe inverter MQTT bridge daemon |
 | `build_openmmg.sh` | Automated build script for the Pi |
 | `modbus_server.py` | Simulated Modbus server for testing |
 | `modbus_client.py` | Modbus client for testing |

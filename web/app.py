@@ -5,16 +5,24 @@ import os
 import re
 import subprocess
 import json
+import asyncio
 from flask import Flask, render_template_string, request, jsonify
 from werkzeug.utils import secure_filename
+
+try:
+    import goodwe
+    GOODWE_AVAILABLE = True
+except ImportError:
+    GOODWE_AVAILABLE = False
 
 app = Flask(__name__)
 
 CONFIG_PATH = "/etc/openmmg/openmmg.conf"
 CERTS_DIR = "/etc/openmmg/certs"
+GOODWE_CONFIG_PATH = "/etc/openmmg/goodwe.json"
 
 # ---------------------------------------------------------------------------
-# Config parser / writer
+# Config parser / writer (openmmg)
 # ---------------------------------------------------------------------------
 
 def parse_config(path=CONFIG_PATH):
@@ -139,6 +147,64 @@ def validate_config(config):
 
 
 # ---------------------------------------------------------------------------
+# GoodWe inverter helpers
+# ---------------------------------------------------------------------------
+
+def load_goodwe_config():
+    """Load GoodWe inverter configuration."""
+    defaults = {
+        "host": "", "port": 8899, "poll_interval": 30,
+        "request_topic": "goodwe/request", "response_topic": "goodwe/response",
+    }
+    try:
+        with open(GOODWE_CONFIG_PATH) as f:
+            defaults.update(json.load(f))
+    except (FileNotFoundError, json.JSONDecodeError):
+        pass
+    return defaults
+
+
+def save_goodwe_config(config):
+    """Save GoodWe inverter configuration."""
+    os.makedirs(os.path.dirname(GOODWE_CONFIG_PATH), exist_ok=True)
+    with open(GOODWE_CONFIG_PATH, "w") as f:
+        json.dump(config, f, indent=2)
+
+
+async def _read_goodwe_data(host, port=8899):
+    """Connect to GoodWe inverter and read runtime data."""
+    inverter = await goodwe.connect(host, port=port)
+    runtime = await inverter.read_runtime_data()
+    info = {
+        "model": getattr(inverter, "model_name", ""),
+        "serial": getattr(inverter, "serial_number", ""),
+        "firmware": getattr(inverter, "firmware", ""),
+        "rated_power": getattr(inverter, "rated_power", 0),
+    }
+    # Group sensors by kind
+    sensors = {}
+    for s in inverter.sensors():
+        if s.id_ in runtime:
+            val = runtime[s.id_]
+            if isinstance(val, (bytes, bytearray)):
+                continue
+            kind = s.kind.name if hasattr(s.kind, "name") else str(s.kind)
+            if kind not in sensors:
+                sensors[kind] = []
+            if hasattr(val, "isoformat"):
+                val = val.isoformat()
+            elif isinstance(val, float):
+                val = round(val, 2)
+            sensors[kind].append({
+                "id": s.id_,
+                "name": s.name,
+                "value": val,
+                "unit": s.unit,
+            })
+    return {"info": info, "sensors": sensors}
+
+
+# ---------------------------------------------------------------------------
 # System info helpers
 # ---------------------------------------------------------------------------
 
@@ -195,6 +261,7 @@ def api_status():
     return jsonify({
         "openmmg": get_service_status("openmmg"),
         "mosquitto": get_service_status("mosquitto"),
+        "goodwe_mqtt": get_service_status("goodwe-mqtt"),
         "system": get_system_info(),
         "serial_ports": get_serial_ports(),
         "logs": get_logs(),
@@ -274,6 +341,61 @@ def api_list_certs():
 
 
 # ---------------------------------------------------------------------------
+# GoodWe API routes
+# ---------------------------------------------------------------------------
+
+@app.route("/api/goodwe/config")
+def api_goodwe_config():
+    cfg = load_goodwe_config()
+    cfg["available"] = GOODWE_AVAILABLE
+    return jsonify(cfg)
+
+
+@app.route("/api/goodwe/config", methods=["POST"])
+def api_save_goodwe_config():
+    data = request.get_json()
+    if not data:
+        return jsonify({"error": "Invalid JSON"}), 400
+    host = (data.get("host") or "").strip()
+    port = int(data.get("port", 8899))
+    poll_interval = int(data.get("poll_interval", 30))
+    config = {
+        "host": host,
+        "port": port,
+        "poll_interval": max(poll_interval, 5) if poll_interval > 0 else 0,
+        "request_topic": data.get("request_topic", "goodwe/request").strip(),
+        "response_topic": data.get("response_topic", "goodwe/response").strip(),
+    }
+    try:
+        save_goodwe_config(config)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+    # Restart goodwe-mqtt if running
+    subprocess.run(
+        ["sudo", "systemctl", "restart", "goodwe-mqtt"],
+        capture_output=True, text=True, timeout=10,
+    )
+    return jsonify({"ok": True, "message": "Inverter config saved"})
+
+
+@app.route("/api/goodwe/data")
+def api_goodwe_data():
+    if not GOODWE_AVAILABLE:
+        return jsonify({"error": "goodwe library not installed"}), 500
+    cfg = load_goodwe_config()
+    if not cfg.get("host"):
+        return jsonify({"error": "not_configured"}), 400
+    try:
+        data = asyncio.run(
+            _read_goodwe_data(cfg["host"], cfg.get("port", 8899))
+        )
+        return jsonify(data)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# ---------------------------------------------------------------------------
 # HTML Template
 # ---------------------------------------------------------------------------
 
@@ -289,6 +411,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     --primary: #2563eb; --primary-hover: #1d4ed8;
     --success: #16a34a; --danger: #dc2626; --warning: #ca8a04;
     --muted: #6b7280; --code-bg: #1e1e1e; --code-fg: #d4d4d4;
+    --solar: #f59e0b; --solar-bg: #fffbeb;
 }
 * { box-sizing: border-box; margin: 0; padding: 0; }
 body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
@@ -296,6 +419,8 @@ body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-
 .container { max-width: 960px; margin: 0 auto; padding: 1rem; }
 h1 { font-size: 1.5rem; margin-bottom: 1rem; }
 h2 { font-size: 1.15rem; margin-bottom: 0.75rem; color: var(--text); }
+h3 { font-size: 0.95rem; margin-bottom: 0.5rem; color: var(--muted); text-transform: uppercase;
+     letter-spacing: 0.05em; border-bottom: 1px solid var(--border); padding-bottom: 0.25rem; }
 .card { background: var(--card); border: 1px solid var(--border);
         border-radius: 8px; padding: 1rem; margin-bottom: 1rem; }
 .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 0.75rem; }
@@ -309,7 +434,7 @@ h2 { font-size: 1.15rem; margin-bottom: 0.75rem; color: var(--text); }
 .log-box { background: var(--code-bg); color: var(--code-fg); padding: 0.75rem;
            border-radius: 6px; font-family: "SF Mono", monospace; font-size: 0.78rem;
            max-height: 300px; overflow-y: auto; white-space: pre-wrap; word-break: break-all; }
-.tabs { display: flex; border-bottom: 2px solid var(--border); margin-bottom: 1rem; }
+.tabs { display: flex; border-bottom: 2px solid var(--border); margin-bottom: 1rem; flex-wrap: wrap; }
 .tab { padding: 0.5rem 1rem; cursor: pointer; border-bottom: 2px solid transparent;
        margin-bottom: -2px; color: var(--muted); font-weight: 500; }
 .tab.active { color: var(--primary); border-bottom-color: var(--primary); }
@@ -331,6 +456,8 @@ btn, .btn { display: inline-block; padding: 0.5rem 1rem; border: none; border-ra
 .btn-sm { padding: 0.3rem 0.7rem; font-size: 0.8rem; }
 .btn-outline { background: transparent; border: 1px solid var(--border); color: var(--text); }
 .btn-outline:hover { background: var(--bg); }
+.btn-solar { background: var(--solar); color: #fff; }
+.btn-solar:hover { background: #d97706; }
 .actions { display: flex; gap: 0.5rem; margin-top: 0.5rem; }
 .toast { position: fixed; bottom: 1.5rem; right: 1.5rem; padding: 0.75rem 1.25rem;
          border-radius: 8px; color: #fff; font-weight: 500; z-index: 999;
@@ -361,9 +488,26 @@ btn, .btn { display: inline-block; padding: 0.5rem 1rem; border: none; border-ra
              padding: 0.4rem 0.6rem; margin-top: 0.5rem; background: var(--bg);
              border-radius: 6px; font-size: 0.85rem; }
 .cert-item code { font-size: 0.8rem; color: var(--muted); }
+
+/* Solar card styles */
+.solar-card { border-left: 3px solid var(--solar); }
+.solar-info { font-size: 0.85rem; color: var(--muted); margin-bottom: 0.75rem; }
+.solar-info strong { color: var(--text); }
+.solar-group { margin-bottom: 1rem; }
+.solar-group:last-child { margin-bottom: 0; }
+.solar-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 0.5rem; }
+.solar-metric { background: var(--bg); border-radius: 6px; padding: 0.5rem 0.75rem; }
+.solar-metric-name { font-size: 0.75rem; color: var(--muted); }
+.solar-metric-value { font-size: 1rem; font-weight: 600; }
+.solar-metric-unit { font-size: 0.8rem; color: var(--muted); font-weight: 400; }
+.solar-placeholder { text-align: center; padding: 2rem 1rem; color: var(--muted); }
+.solar-placeholder p { margin-bottom: 0.5rem; }
+.solar-error { color: var(--danger); text-align: center; padding: 1rem; }
+
 @media (max-width: 600px) {
     .form-row, .form-row-3 { grid-template-columns: 1fr; }
     .grid { grid-template-columns: 1fr 1fr; }
+    .solar-grid { grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); }
 }
 </style>
 </head>
@@ -380,10 +524,24 @@ btn, .btn { display: inline-block; padding: 0.5rem 1rem; border: none; border-ra
         <div class="grid" id="status-grid">
             <div><span class="stat-label">openmmg</span><div class="stat-value" id="st-openmmg">...</div></div>
             <div><span class="stat-label">mosquitto</span><div class="stat-value" id="st-mosquitto">...</div></div>
+            <div><span class="stat-label">goodwe-mqtt</span><div class="stat-value" id="st-goodwe-mqtt">...</div></div>
             <div><span class="stat-label">Uptime</span><div class="stat-value" id="st-uptime">...</div></div>
             <div><span class="stat-label">Memory</span><div class="stat-value" id="st-memory">...</div></div>
             <div><span class="stat-label">Disk</span><div class="stat-value" id="st-disk">...</div></div>
             <div><span class="stat-label">Serial Ports</span><div class="stat-value" id="st-serial">...</div></div>
+        </div>
+    </div>
+
+    <!-- Solar Inverter Dashboard -->
+    <div class="card solar-card" id="solar-card">
+        <div class="section-header">
+            <h2>Solar Inverter</h2>
+            <button class="btn btn-outline btn-sm" onclick="refreshSolar()">Refresh</button>
+        </div>
+        <div id="solar-content">
+            <div class="solar-placeholder">
+                <p>Loading inverter data...</p>
+            </div>
         </div>
     </div>
 
@@ -393,6 +551,7 @@ btn, .btn { display: inline-block; padding: 0.5rem 1rem; border: none; border-ra
             <div class="tab active" data-tab="mqtt">MQTT</div>
             <div class="tab" data-tab="serial">Serial Gateways</div>
             <div class="tab" data-tab="rules">Security Rules</div>
+            <div class="tab" data-tab="inverter">Inverter</div>
         </div>
 
         <!-- MQTT Config -->
@@ -496,7 +655,34 @@ btn, .btn { display: inline-block; padding: 0.5rem 1rem; border: none; border-ra
             <div id="rules-list"></div>
         </div>
 
-        <div class="actions" style="margin-top:1rem">
+        <!-- Inverter Config -->
+        <div class="tab-content" id="tab-inverter">
+            <h2>GoodWe Inverter</h2>
+            <p style="font-size:0.85rem;color:var(--muted);margin-bottom:1rem">
+                Connect to a GoodWe solar inverter on your local network via its WiFi/LAN dongle.
+                The MQTT bridge daemon publishes register data to MQTT topics.
+            </p>
+            <div class="form-row">
+                <div><label>Inverter IP Address</label><input type="text" id="gw-host" placeholder="e.g. 192.168.1.100"></div>
+                <div><label>Port</label><input type="text" id="gw-port" value="8899" placeholder="8899"></div>
+            </div>
+            <h3 style="margin-top:1rem;margin-bottom:0.5rem;font-size:0.9rem;color:var(--muted)">MQTT Bridge</h3>
+            <div class="form-row">
+                <div><label>Request Topic</label><input type="text" id="gw-request-topic" value="goodwe/request"></div>
+                <div><label>Response Topic</label><input type="text" id="gw-response-topic" value="goodwe/response"></div>
+            </div>
+            <div class="form-row">
+                <div><label>Poll Interval (seconds)</label><input type="text" id="gw-poll-interval" value="30" placeholder="30"></div>
+                <div></div>
+            </div>
+            <div class="actions">
+                <button class="btn btn-solar" onclick="saveInverterConfig()">Save Inverter Config</button>
+                <button class="btn btn-outline" onclick="testInverter()">Test Connection</button>
+            </div>
+            <div id="inverter-test-result" style="margin-top:0.75rem"></div>
+        </div>
+
+        <div class="actions" style="margin-top:1rem" id="main-save-actions">
             <button class="btn btn-primary" onclick="saveConfig()">Save &amp; Restart</button>
         </div>
     </div>
@@ -521,6 +707,9 @@ document.querySelectorAll('.tab').forEach(tab => {
         document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
         tab.classList.add('active');
         document.getElementById('tab-' + tab.dataset.tab).classList.add('active');
+        // Hide main save button on inverter tab (it has its own save)
+        document.getElementById('main-save-actions').style.display =
+            tab.dataset.tab === 'inverter' ? 'none' : 'flex';
     });
 });
 
@@ -542,9 +731,10 @@ function refreshStatus() {
     fetch('/api/status').then(r => r.json()).then(data => {
         document.getElementById('st-openmmg').innerHTML = badge(data.openmmg.active);
         document.getElementById('st-mosquitto').innerHTML = badge(data.mosquitto.active);
-        document.getElementById('st-uptime').textContent = data.system.uptime || '—';
-        document.getElementById('st-memory').textContent = data.system.memory || '—';
-        document.getElementById('st-disk').textContent = data.system.disk || '—';
+        document.getElementById('st-goodwe-mqtt').innerHTML = badge(data.goodwe_mqtt.active);
+        document.getElementById('st-uptime').textContent = data.system.uptime || '\u2014';
+        document.getElementById('st-memory').textContent = data.system.memory || '\u2014';
+        document.getElementById('st-disk').textContent = data.system.disk || '\u2014';
         document.getElementById('st-serial').textContent = data.serial_ports.length ? data.serial_ports.join(', ') : 'none';
         document.getElementById('log-box').textContent = data.logs || 'No logs available';
     }).catch(() => showToast('Failed to load status', 'error'));
@@ -830,11 +1020,160 @@ function collectRules() {
     return rules;
 }
 
+// --- GoodWe Solar Inverter ---
+const KIND_LABELS = {
+    'PV': 'Solar Panels',
+    'BAT': 'Battery',
+    'GRID': 'Grid',
+    'AC': 'AC Output',
+    'UPS': 'Backup / UPS',
+    'BMS': 'Battery Management',
+};
+const KIND_ORDER = ['PV', 'BAT', 'GRID', 'AC', 'UPS', 'BMS'];
+
+function loadInverterConfig() {
+    fetch('/api/goodwe/config').then(r => r.json()).then(data => {
+        document.getElementById('gw-host').value = data.host || '';
+        document.getElementById('gw-port').value = data.port || 8899;
+        document.getElementById('gw-request-topic').value = data.request_topic || 'goodwe/request';
+        document.getElementById('gw-response-topic').value = data.response_topic || 'goodwe/response';
+        document.getElementById('gw-poll-interval').value = data.poll_interval || 30;
+    }).catch(() => {});
+}
+
+function saveInverterConfig() {
+    const host = document.getElementById('gw-host').value.trim();
+    const port = document.getElementById('gw-port').value.trim() || '8899';
+    const reqTopic = document.getElementById('gw-request-topic').value.trim() || 'goodwe/request';
+    const resTopic = document.getElementById('gw-response-topic').value.trim() || 'goodwe/response';
+    const pollInterval = document.getElementById('gw-poll-interval').value.trim() || '30';
+    fetch('/api/goodwe/config', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+            host: host, port: parseInt(port),
+            request_topic: reqTopic, response_topic: resTopic,
+            poll_interval: parseInt(pollInterval)
+        })
+    }).then(r => r.json()).then(data => {
+        if (data.ok) {
+            showToast('Inverter config saved', 'success');
+            refreshSolar();
+        } else {
+            showToast('Error: ' + data.error, 'error');
+        }
+    }).catch(() => showToast('Save failed', 'error'));
+}
+
+function testInverter() {
+    const resultEl = document.getElementById('inverter-test-result');
+    resultEl.innerHTML = '<span style="color:var(--muted)">Connecting...</span>';
+    // Save first, then test
+    const host = document.getElementById('gw-host').value.trim();
+    const port = document.getElementById('gw-port').value.trim() || '8899';
+    if (!host) {
+        resultEl.innerHTML = '<span style="color:var(--danger)">Enter an IP address first</span>';
+        return;
+    }
+    fetch('/api/goodwe/config', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({host: host, port: parseInt(port)})
+    }).then(() => fetch('/api/goodwe/data')).then(r => r.json()).then(data => {
+        if (data.error) {
+            resultEl.innerHTML = '<span style="color:var(--danger)">Connection failed: ' +
+                data.error + '</span>';
+        } else {
+            const info = data.info || {};
+            resultEl.innerHTML = '<span style="color:var(--success)">Connected! ' +
+                (info.model || 'Unknown model') + ' (Serial: ' + (info.serial || 'N/A') + ')</span>';
+            refreshSolar();
+        }
+    }).catch(() => {
+        resultEl.innerHTML = '<span style="color:var(--danger)">Connection failed (timeout or network error)</span>';
+    });
+}
+
+function refreshSolar() {
+    const el = document.getElementById('solar-content');
+    fetch('/api/goodwe/data').then(r => r.json()).then(data => {
+        if (data.error === 'not_configured') {
+            el.innerHTML = '<div class="solar-placeholder">' +
+                '<p>No inverter configured</p>' +
+                '<p style="font-size:0.85rem">Set the inverter IP address in the <a href="#" onclick="' +
+                "document.querySelector('[data-tab=inverter]').click();return false;" +
+                '" style="color:var(--primary)">Inverter</a> config tab below.</p></div>';
+            return;
+        }
+        if (data.error) {
+            el.innerHTML = '<div class="solar-error">Unable to reach inverter: ' +
+                data.error + '</div>';
+            return;
+        }
+        renderSolarData(data);
+    }).catch(() => {
+        el.innerHTML = '<div class="solar-error">Failed to fetch inverter data</div>';
+    });
+}
+
+function renderSolarData(data) {
+    const el = document.getElementById('solar-content');
+    let html = '';
+
+    // Info bar
+    const info = data.info || {};
+    if (info.model || info.serial) {
+        html += '<div class="solar-info">';
+        if (info.model) html += '<strong>' + info.model + '</strong>';
+        if (info.serial) html += ' &middot; Serial: ' + info.serial;
+        if (info.firmware) html += ' &middot; FW: ' + info.firmware;
+        if (info.rated_power) html += ' &middot; ' + (info.rated_power / 1000).toFixed(1) + ' kW';
+        html += '</div>';
+    }
+
+    // Sensor groups
+    const sensors = data.sensors || {};
+    const sortedKinds = KIND_ORDER.filter(k => sensors[k]);
+    // Add any kinds not in our predefined order
+    Object.keys(sensors).forEach(k => { if (!sortedKinds.includes(k)) sortedKinds.push(k); });
+
+    sortedKinds.forEach(kind => {
+        const items = sensors[kind];
+        if (!items || !items.length) return;
+        const label = KIND_LABELS[kind] || kind;
+        html += '<div class="solar-group"><h3>' + label + '</h3><div class="solar-grid">';
+        items.forEach(s => {
+            let displayVal = s.value;
+            if (typeof displayVal === 'number') {
+                // Format large numbers with commas
+                if (Math.abs(displayVal) >= 1000) {
+                    displayVal = displayVal.toLocaleString();
+                }
+            }
+            const unit = s.unit || '';
+            html += '<div class="solar-metric">' +
+                '<div class="solar-metric-name">' + s.name + '</div>' +
+                '<div class="solar-metric-value">' + displayVal +
+                (unit ? ' <span class="solar-metric-unit">' + unit + '</span>' : '') +
+                '</div></div>';
+        });
+        html += '</div></div>';
+    });
+
+    if (!html) {
+        html = '<div class="solar-placeholder"><p>No sensor data available</p></div>';
+    }
+    el.innerHTML = html;
+}
+
 // --- Init ---
 refreshStatus();
 loadConfig();
-// Auto-refresh status every 30s
+loadInverterConfig();
+refreshSolar();
+// Auto-refresh every 30s
 setInterval(refreshStatus, 30000);
+setInterval(refreshSolar, 30000);
 </script>
 </body>
 </html>
