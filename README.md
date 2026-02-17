@@ -45,19 +45,24 @@ sudo apt-get install -y mosquitto mosquitto-clients
 
 See [MQTT Bridge protocol](#mqtt-bridge) below for the request/response format.
 
-### Query Tool (ES Inverters)
+### Query Tool
 
-Once the bridge is running, use `goodwe-query.sh` to read/write inverter registers via MQTT. It reads broker settings from `goodwe.json` automatically.
+Once the bridge is running, use `goodwe-query.sh` to read/write inverter registers via MQTT. It auto-detects the inverter model and queries the correct registers:
+
+- **ES family** (GW5048D-ES, EM, BP) -- hybrid with battery, registers at 35100+
+- **DT family** (GW5000D-NS, DT, MS, XS) -- grid-tied, no battery, registers at 30100+
 
 ```bash
-./goodwe-query.sh              # Read all ES register groups
+./goodwe-query.sh              # Auto-detect model, read all registers
+./goodwe-query.sh info         # Show inverter model/serial/family
 ./goodwe-query.sh pv           # PV solar panel data
-./goodwe-query.sh battery      # Battery status
+./goodwe-query.sh battery      # Battery status (ES only)
 ./goodwe-query.sh grid         # Grid and load data
 ./goodwe-query.sh energy       # Energy totals (today / lifetime)
+./goodwe-query.sh meter        # Grid import/export meter (D-NS only)
 ./goodwe-query.sh settings     # Inverter configuration
-./goodwe-query.sh eco          # Eco mode schedules
-./goodwe-query.sh write 45052 5000  # Set grid export limit to 5000W
+./goodwe-query.sh eco          # Eco mode schedules (ES only)
+./goodwe-query.sh write 45052 5000  # Write register (with confirmation)
 ```
 
 Requires `mosquitto_pub`/`mosquitto_sub` (`brew install mosquitto` on Mac) and either `jq` or `python3` to parse the config.
@@ -524,7 +529,7 @@ The port will appear as `/dev/ttySC0`.
 |------|-------------|
 | `web/app.py` | Flask web management UI (includes GoodWe integration) |
 | `goodwe_mqtt.py` | GoodWe inverter MQTT bridge daemon |
-| `goodwe-query.sh` | ES inverter query/write tool (uses MQTT) |
+| `goodwe-query.sh` | Inverter query/write tool with auto-detection (ES/D-NS) |
 | `build_openmmg.sh` | Automated build script for the Pi |
 | `modbus_server.py` | Simulated Modbus server for testing |
 | `modbus_client.py` | Modbus client for testing |

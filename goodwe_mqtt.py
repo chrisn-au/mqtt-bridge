@@ -215,21 +215,19 @@ class GoodWeBridge:
         log.info("Response: %s", result)
 
     async def _handle_request(self, payload):
-        """Parse and execute a register read/write request."""
+        """Parse and execute a register read/write request.
+
+        Formats:
+            COOKIE INVERTER_ID FUNC REG COUNT [DATA...]   (register read/write)
+            COOKIE INVERTER_ID info                        (device info query)
+        """
         parts = payload.split()
-        if len(parts) < 5:
+        if len(parts) < 3:
             cookie = parts[0] if parts else "0"
-            return f"{cookie} ERR invalid format: need COOKIE INVERTER_ID FUNC REG COUNT"
+            return f"{cookie} ERR invalid format: need COOKIE INVERTER_ID FUNC ..."
 
         cookie = parts[0]
         inverter_id = parts[1]
-
-        try:
-            func = int(parts[2])
-            reg = int(parts[3])
-            count = int(parts[4])
-        except ValueError:
-            return f"{cookie} ERR invalid numeric values"
 
         inv_cfg = self._get_inverter(inverter_id)
         if not inv_cfg:
@@ -239,6 +237,20 @@ class GoodWeBridge:
         port = int(inv_cfg.get("port", 8899))
         if not host:
             return f"{cookie} ERR inverter {inverter_id} has no host configured"
+
+        # Handle 'info' command
+        if parts[2].lower() == "info":
+            return await self._device_info(host, port, cookie)
+
+        if len(parts) < 5:
+            return f"{cookie} ERR invalid format: need COOKIE INVERTER_ID FUNC REG COUNT"
+
+        try:
+            func = int(parts[2])
+            reg = int(parts[3])
+            count = int(parts[4])
+        except ValueError:
+            return f"{cookie} ERR invalid numeric values"
 
         inverter = await goodwe.connect(host, port=port)
 
@@ -258,6 +270,17 @@ class GoodWeBridge:
             return await self._write_multi(inverter, cookie, reg, data)
         else:
             return f"{cookie} ERR unsupported function {func}"
+
+    async def _device_info(self, host, port, cookie):
+        """Query inverter model, serial number, and family."""
+        try:
+            inverter = await goodwe.connect(host, port=port)
+            model = getattr(inverter, "model_name", "unknown")
+            serial = getattr(inverter, "serial_number", "unknown")
+            family = type(inverter).__name__
+            return f"{cookie} OK model={model} serial={serial} family={family}"
+        except Exception as e:
+            return f"{cookie} ERR {e}"
 
     async def _read_registers(self, inverter, cookie, offset, count):
         """Read registers and return raw 16-bit values."""
