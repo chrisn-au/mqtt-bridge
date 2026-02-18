@@ -515,7 +515,7 @@ To also enable the CAN bus side (MCP2515), add to `/boot/firmware/config.txt`:
 
 ```
 dtparam=spi=on
-dtoverlay=mcp2515-can0,oscillator=8000000,interrupt=25
+dtoverlay=mcp2515-can0,oscillator=12000000,interrupt=25
 ```
 
 Then bring up the CAN interface:
