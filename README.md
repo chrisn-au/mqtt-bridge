@@ -503,9 +503,54 @@ To use the Pi's GPIO UART for Modbus:
 2. For Pi 3/4/5 with Bluetooth, add `dtoverlay=disable-bt` to `/boot/firmware/config.txt` and reboot
 3. The UART will be available at `/dev/ttyAMA0`
 
-### RS485 HAT
+### Waveshare RS485/CAN HAT
 
-For SPI-based RS485 HATs (e.g., Waveshare), add the appropriate overlay to `/boot/firmware/config.txt`:
+The [Waveshare RS485 CAN HAT](https://www.waveshare.com/rs485-can-hat.htm) provides both RS485 (via UART/MAX3485) and CAN bus (via SPI/MCP2515) on a single board. The RS485 side uses the Pi's native UART, so no special overlay is needed for Modbus.
+
+1. Ensure `enable_uart=1` is in `/boot/firmware/config.txt` (under `[all]`)
+2. The serial port appears as `/dev/serial0`
+3. Set `option device '/dev/serial0'` in the openmmg serial gateway config
+
+To also enable the CAN bus side (MCP2515), add to `/boot/firmware/config.txt`:
+
+```
+dtparam=spi=on
+dtoverlay=mcp2515-can0,oscillator=8000000,interrupt=25
+```
+
+Then bring up the CAN interface:
+
+```bash
+sudo ip link set can0 type can bitrate 500000
+sudo ip link set can0 up
+```
+
+To make CAN persist across reboots, create `/etc/systemd/system/can0.service`:
+
+```ini
+[Unit]
+Description=CAN bus interface can0
+After=network-pre.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/sbin/ip link set can0 type can bitrate 500000
+ExecStart=/sbin/ip link set can0 up
+ExecStop=/sbin/ip link set can0 down
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo systemctl enable --now can0.service
+sudo apt-get install -y can-utils  # candump, cansend, etc.
+```
+
+### SPI UART RS485 HAT
+
+For SPI-based RS485 HATs using a UART expander (e.g., SC16IS752), add the appropriate overlay to `/boot/firmware/config.txt`:
 
 ```
 dtoverlay=sc16is752-spi1,int_pin=24
