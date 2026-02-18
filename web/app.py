@@ -20,6 +20,9 @@ app = Flask(__name__)
 CONFIG_PATH = "/etc/openmmg/openmmg.conf"
 CERTS_DIR = "/etc/openmmg/certs"
 GOODWE_CONFIG_PATH = "/etc/openmmg/goodwe.json"
+QUERY_SCRIPT = "/opt/openmmg-web/goodwe-query.sh"
+_QUERY_COMMANDS = {"info", "pv", "battery", "grid", "energy", "system",
+                   "meter", "settings", "eco", "all"}
 
 # ---------------------------------------------------------------------------
 # Config parser / writer (openmmg)
@@ -431,6 +434,283 @@ def api_goodwe_data():
 
 
 # ---------------------------------------------------------------------------
+# Network diagnostics API
+# ---------------------------------------------------------------------------
+
+_SAFE_HOST_RE = re.compile(r'^[a-zA-Z0-9._:-]+$')
+
+
+@app.route("/api/network/info")
+def api_network_info():
+    """Return Pi network interfaces, gateway, and hostname."""
+    interfaces = []
+    try:
+        out = subprocess.run(
+            ["ip", "-4", "addr", "show"],
+            capture_output=True, text=True, timeout=5,
+        )
+        current_iface = None
+        for line in out.stdout.splitlines():
+            # Interface line: "2: eth0: <BROADCAST,..."
+            m = re.match(r'^\d+:\s+(\S+?):', line)
+            if m:
+                current_iface = m.group(1)
+                continue
+            # Address line: "    inet 192.168.2.110/24 ..."
+            m = re.match(r'^\s+inet\s+(\S+)', line)
+            if m and current_iface:
+                interfaces.append({"name": current_iface, "address": m.group(1)})
+    except Exception:
+        pass
+    gateway = run_cmd("ip route | awk '/default/{print $3; exit}'")
+    hostname = run_cmd("hostname")
+    return jsonify({"interfaces": interfaces, "gateway": gateway, "hostname": hostname})
+
+
+def _udp_discover():
+    """Direct UDP broadcast discover with SO_BROADCAST set."""
+    import socket as _socket
+    sock = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
+    sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_BROADCAST, 1)
+    sock.settimeout(3)
+    sock.sendto(b"WIFIKIT-214028-READ", ("255.255.255.255", 48899))
+    results = []
+    seen = set()
+    while True:
+        try:
+            data, addr = sock.recvfrom(1024)
+        except _socket.timeout:
+            break
+        ip = addr[0]
+        if ip in seen:
+            continue
+        seen.add(ip)
+        text = data.decode("utf-8", errors="replace").strip()
+        parts = text.split(",")
+        results.append({
+            "ip": ip,
+            "serial": parts[2].strip() if len(parts) > 2 else "",
+            "mac": parts[1].strip() if len(parts) > 1 else "",
+            "name": parts[0].strip() if parts else "",
+        })
+    sock.close()
+    return results
+
+
+@app.route("/api/network/discover", methods=["POST"])
+def api_network_discover():
+    """Broadcast UDP to discover GoodWe inverters on the local network."""
+    # Try direct UDP broadcast first, fall back to goodwe library
+    try:
+        return jsonify({"inverters": _udp_discover()})
+    except Exception:
+        pass
+    if not GOODWE_AVAILABLE:
+        return jsonify({"error": "Discovery failed and goodwe library not installed"}), 500
+    try:
+        inverters = asyncio.run(goodwe.search_inverters())
+        results = []
+        for inv in inverters:
+            results.append({
+                "ip": getattr(inv, "host", "") or getattr(inv, "ip_address", ""),
+                "mac": getattr(inv, "mac", "") or getattr(inv, "mac_address", ""),
+                "serial": getattr(inv, "serial_number", ""),
+                "name": getattr(inv, "name", ""),
+            })
+        return jsonify({"inverters": results})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/network/ping", methods=["POST"])
+def api_network_ping():
+    """Ping a host (no shell injection — uses list args)."""
+    data = request.get_json() or {}
+    host = (data.get("host") or "").strip()
+    if not host or not _SAFE_HOST_RE.match(host):
+        return jsonify({"error": "Invalid host"}), 400
+    try:
+        result = subprocess.run(
+            ["ping", "-c", "3", "-W", "2", host],
+            capture_output=True, text=True, timeout=15,
+        )
+        return jsonify({
+            "reachable": result.returncode == 0,
+            "output": result.stdout + result.stderr,
+        })
+    except subprocess.TimeoutExpired:
+        return jsonify({"reachable": False, "output": "Ping timed out"})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/network/test-port", methods=["POST"])
+def api_network_test_port():
+    """Test TCP or UDP connectivity to host:port via Python socket."""
+    import socket as _socket
+    data = request.get_json() or {}
+    host = (data.get("host") or "").strip()
+    port = data.get("port")
+    protocol = (data.get("protocol") or "tcp").lower()
+    if not host or not _SAFE_HOST_RE.match(host):
+        return jsonify({"error": "Invalid host"}), 400
+    try:
+        port = int(port)
+        if not 1 <= port <= 65535:
+            raise ValueError
+    except (TypeError, ValueError):
+        return jsonify({"error": "Invalid port (1-65535)"}), 400
+    if protocol not in ("tcp", "udp"):
+        return jsonify({"error": "Protocol must be tcp or udp"}), 400
+    timeout = min(int(data.get("timeout", 3)), 10)
+    try:
+        if protocol == "tcp":
+            sock = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+            sock.settimeout(timeout)
+            result = sock.connect_ex((host, port))
+            sock.close()
+            return jsonify({"open": result == 0, "protocol": "tcp",
+                            "detail": "Connection refused" if result else "Open"})
+        else:
+            sock = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
+            sock.settimeout(timeout)
+            sock.sendto(b'\x00', (host, port))
+            try:
+                sock.recvfrom(1024)
+                detail = "Responded"
+                is_open = True
+            except _socket.timeout:
+                detail = "No response (may still be open)"
+                is_open = True
+            except ConnectionRefusedError:
+                detail = "Port closed (ICMP unreachable)"
+                is_open = False
+            sock.close()
+            return jsonify({"open": is_open, "protocol": "udp", "detail": detail})
+    except _socket.gaierror:
+        return jsonify({"error": f"Cannot resolve host: {host}"}), 400
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/network/wifi/scan")
+def api_wifi_scan():
+    """Scan for available WiFi networks via nmcli."""
+    try:
+        result = subprocess.run(
+            ["nmcli", "-t", "-f", "SSID,SIGNAL,SECURITY", "device", "wifi",
+             "list", "--rescan", "yes"],
+            capture_output=True, text=True, timeout=15,
+        )
+        if result.returncode != 0:
+            return jsonify({"error": "WiFi scan failed: " + result.stderr.strip()}), 500
+        networks = []
+        seen = set()
+        for line in result.stdout.strip().splitlines():
+            parts = line.split(":", 2)
+            if len(parts) < 3:
+                continue
+            ssid = parts[0].strip()
+            if not ssid or ssid in seen:
+                continue
+            seen.add(ssid)
+            try:
+                signal = int(parts[1].strip())
+            except ValueError:
+                signal = 0
+            networks.append({
+                "ssid": ssid,
+                "signal": signal,
+                "security": parts[2].strip(),
+            })
+        networks.sort(key=lambda n: n["signal"], reverse=True)
+        # Get current SSID from nmcli active wifi list
+        current = run_cmd(
+            "nmcli -t -f ACTIVE,SSID dev wifi list"
+            " | grep '^yes:' | head -1 | cut -d: -f2-"
+        )
+        return jsonify({"networks": networks, "current": current})
+    except subprocess.TimeoutExpired:
+        return jsonify({"error": "WiFi scan timed out"}), 500
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/network/wifi/connect", methods=["POST"])
+def api_wifi_connect():
+    """Connect to a WiFi network via nmcli."""
+    data = request.get_json() or {}
+    ssid = (data.get("ssid") or "").strip()
+    password = (data.get("password") or "").strip()
+    if not ssid or len(ssid) > 64:
+        return jsonify({"error": "SSID must be 1-64 characters"}), 400
+    if password and len(password) > 63:
+        return jsonify({"error": "Password must be at most 63 characters"}), 400
+    try:
+        cmd = ["nmcli", "device", "wifi", "connect", ssid]
+        if password:
+            cmd += ["password", password]
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode != 0:
+            msg = result.stderr.strip() or result.stdout.strip()
+            return jsonify({"error": msg or "Connection failed"}), 500
+        return jsonify({"ok": True, "message": result.stdout.strip()})
+    except subprocess.TimeoutExpired:
+        return jsonify({"error": "Connection attempt timed out"}), 500
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# ---------------------------------------------------------------------------
+# GoodWe Query Tool API
+# ---------------------------------------------------------------------------
+
+@app.route("/api/goodwe/query", methods=["POST"])
+def api_goodwe_query():
+    """Run goodwe-query.sh commands and return output."""
+    data = request.get_json() or {}
+    command = (data.get("command") or "").strip().lower()
+
+    if command == "write":
+        register = (data.get("register") or "").strip()
+        value = (data.get("value") or "").strip()
+        if not register or not register.isdigit():
+            return jsonify({"error": "Register must be a positive number"}), 400
+        if not value or not value.lstrip("-").isdigit():
+            return jsonify({"error": "Value must be numeric"}), 400
+        cmd = [QUERY_SCRIPT, "write", register, value]
+        stdin_data = "y\n"
+    elif command in _QUERY_COMMANDS:
+        cmd = [QUERY_SCRIPT, command]
+        stdin_data = None
+    else:
+        return jsonify({"error": f"Unknown command: {command}"}), 400
+
+    try:
+        env = os.environ.copy()
+        env["GOODWE_CONFIG"] = GOODWE_CONFIG_PATH
+        inverter_id = (data.get("inverter_id") or "").strip()
+        if inverter_id:
+            env["GOODWE_INV_ID"] = inverter_id
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=120,
+            input=stdin_data, env=env,
+        )
+        output = result.stdout
+        if result.stderr:
+            output += "\n" + result.stderr
+        return jsonify({"output": output.strip(), "exit_code": result.returncode})
+    except subprocess.TimeoutExpired:
+        return jsonify({"error": "Command timed out"}), 500
+    except FileNotFoundError:
+        return jsonify({"error": "goodwe-query.sh not found on this system"}), 500
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# ---------------------------------------------------------------------------
 # HTML Template
 # ---------------------------------------------------------------------------
 
@@ -539,10 +819,44 @@ btn, .btn { display: inline-block; padding: 0.5rem 1rem; border: none; border-ra
 .solar-placeholder p { margin-bottom: 0.5rem; }
 .solar-error { color: var(--danger); text-align: center; padding: 1rem; }
 
+/* Network diagnostics card */
+.net-card { border-left: 3px solid var(--primary); }
+.net-section { margin-bottom: 1rem; }
+.net-section:last-child { margin-bottom: 0; }
+.net-table { width: 100%; border-collapse: collapse; font-size: 0.85rem; margin-top: 0.5rem; }
+.net-table th, .net-table td { text-align: left; padding: 0.35rem 0.5rem;
+    border-bottom: 1px solid var(--border); }
+.net-table th { color: var(--muted); font-weight: 500; font-size: 0.8rem; text-transform: uppercase;
+    letter-spacing: 0.03em; }
+.net-output { background: var(--code-bg); color: var(--code-fg); padding: 0.6rem;
+    border-radius: 6px; font-family: "SF Mono", monospace; font-size: 0.78rem;
+    max-height: 200px; overflow-y: auto; white-space: pre-wrap; word-break: break-all;
+    margin-top: 0.5rem; }
+.net-inline-form { display: flex; gap: 0.5rem; align-items: end; flex-wrap: wrap; }
+.net-inline-form .field { display: flex; flex-direction: column; }
+.net-inline-form .field label { margin-bottom: 0.2rem; }
+.net-inline-form .field input, .net-inline-form .field select {
+    margin-bottom: 0; width: auto; min-width: 140px; }
+.net-result { margin-top: 0.5rem; font-size: 0.85rem; }
+.net-result .ok { color: var(--success); font-weight: 600; }
+.net-result .fail { color: var(--danger); font-weight: 600; }
+.net-result .info { color: var(--muted); }
+.wifi-signal { display: inline-block; width: 48px; height: 14px; background: var(--border);
+    border-radius: 3px; overflow: hidden; vertical-align: middle; }
+.wifi-signal-fill { height: 100%; border-radius: 3px; }
+.wifi-password-row { display: flex; gap: 0.5rem; align-items: center; margin-top: 0.4rem; }
+.wifi-password-row input[type="password"] { margin-bottom: 0; width: auto; min-width: 160px;
+    padding: 0.35rem 0.5rem; font-size: 0.85rem; }
+.wifi-status { font-size: 0.85rem; margin-left: 0.5rem; }
+.wifi-current { font-size: 0.85rem; color: var(--muted); margin-bottom: 0.5rem; }
+.wifi-current strong { color: var(--text); }
+
 @media (max-width: 600px) {
     .form-row, .form-row-3 { grid-template-columns: 1fr; }
     .grid { grid-template-columns: 1fr 1fr; }
     .solar-grid { grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); }
+    .net-inline-form { flex-direction: column; }
+    .net-inline-form .field input, .net-inline-form .field select { width: 100%; }
 }
 </style>
 </head>
@@ -567,6 +881,68 @@ btn, .btn { display: inline-block; padding: 0.5rem 1rem; border: none; border-ra
         </div>
     </div>
 
+    <!-- Network Diagnostics -->
+    <div class="card net-card" id="network-card">
+        <h2>Network Diagnostics</h2>
+
+        <div class="net-section">
+            <h3>Interfaces</h3>
+            <div id="net-interfaces"><span style="color:var(--muted)">Loading...</span></div>
+        </div>
+
+        <div class="net-section">
+            <h3>WiFi</h3>
+            <div id="wifi-current" class="wifi-current"></div>
+            <div class="net-inline-form">
+                <button class="btn btn-primary btn-sm" onclick="scanWifi()" id="btn-wifi-scan">Scan Networks</button>
+            </div>
+            <div id="wifi-scan-result" class="net-result"></div>
+        </div>
+
+        <div class="net-section">
+            <h3>Inverter Discovery</h3>
+            <div class="net-inline-form">
+                <button class="btn btn-primary btn-sm" onclick="discoverInverters()" id="btn-discover">Scan Network</button>
+            </div>
+            <div id="net-discover-result" class="net-result"></div>
+        </div>
+
+        <div class="net-section">
+            <h3>Ping Test</h3>
+            <div class="net-inline-form">
+                <div class="field">
+                    <label>Host</label>
+                    <input type="text" id="ping-host" placeholder="192.168.2.1">
+                </div>
+                <button class="btn btn-primary btn-sm" onclick="runPing()" id="btn-ping">Ping</button>
+            </div>
+            <div id="net-ping-result" class="net-result"></div>
+        </div>
+
+        <div class="net-section">
+            <h3>Port Test</h3>
+            <div class="net-inline-form">
+                <div class="field">
+                    <label>Host</label>
+                    <input type="text" id="port-host" placeholder="192.168.2.1">
+                </div>
+                <div class="field">
+                    <label>Port</label>
+                    <input type="number" id="port-port" placeholder="8899" style="min-width:80px">
+                </div>
+                <div class="field">
+                    <label>Protocol</label>
+                    <select id="port-proto" style="min-width:80px">
+                        <option value="tcp">TCP</option>
+                        <option value="udp">UDP</option>
+                    </select>
+                </div>
+                <button class="btn btn-primary btn-sm" onclick="runPortTest()" id="btn-port">Test</button>
+            </div>
+            <div id="net-port-result" class="net-result"></div>
+        </div>
+    </div>
+
     <!-- Solar Inverter Dashboard -->
     <div class="card solar-card" id="solar-card">
         <div class="section-header">
@@ -587,6 +963,7 @@ btn, .btn { display: inline-block; padding: 0.5rem 1rem; border: none; border-ra
             <div class="tab" data-tab="serial">Serial Gateways</div>
             <div class="tab" data-tab="rules">Security Rules</div>
             <div class="tab" data-tab="inverter">Inverter</div>
+            <div class="tab" data-tab="query">Query Tool</div>
         </div>
 
         <!-- MQTT Config -->
@@ -712,6 +1089,74 @@ btn, .btn { display: inline-block; padding: 0.5rem 1rem; border: none; border-ra
             <div id="inverter-test-result" style="margin-top:0.75rem"></div>
         </div>
 
+        <!-- Query Tool -->
+        <div class="tab-content" id="tab-query">
+            <h2>Inverter Query Tool</h2>
+
+            <div class="net-section">
+                <h3>Inverters</h3>
+                <div id="qt-inverter-list"></div>
+                <div class="net-inline-form" style="margin-top:0.5rem">
+                    <div class="field">
+                        <label>IP Address</label>
+                        <input type="text" id="qt-add-host" placeholder="192.168.1.100" style="min-width:150px">
+                    </div>
+                    <div class="field">
+                        <label>Port</label>
+                        <input type="number" id="qt-add-port" placeholder="8899" value="8899" style="min-width:80px">
+                    </div>
+                    <div class="field">
+                        <label>Name</label>
+                        <input type="text" id="qt-add-name" placeholder="optional" style="min-width:100px">
+                    </div>
+                    <button class="btn btn-outline btn-sm" onclick="qtAddInverter()">+ Add</button>
+                    <button class="btn btn-primary btn-sm" onclick="qtDiscover()" id="btn-qt-discover">Discover</button>
+                    <button class="btn btn-solar btn-sm" onclick="qtSaveInverters()">Save</button>
+                </div>
+                <div id="qt-discover-result" class="net-result"></div>
+            </div>
+
+            <div class="net-section">
+                <h3>Query</h3>
+                <div class="net-inline-form" style="margin-bottom:0.75rem">
+                    <div class="field">
+                        <label>Target Inverter</label>
+                        <select id="qt-target" style="min-width:180px"></select>
+                    </div>
+                </div>
+                <div class="actions" style="flex-wrap:wrap;margin-bottom:0.75rem">
+                    <button class="btn btn-solar btn-sm" onclick="runQuery('all')">All Registers</button>
+                    <button class="btn btn-outline btn-sm" onclick="runQuery('info')">Info</button>
+                    <button class="btn btn-outline btn-sm" onclick="runQuery('pv')">PV</button>
+                    <button class="btn btn-outline btn-sm" onclick="runQuery('battery')">Battery</button>
+                    <button class="btn btn-outline btn-sm" onclick="runQuery('grid')">Grid</button>
+                    <button class="btn btn-outline btn-sm" onclick="runQuery('energy')">Energy</button>
+                    <button class="btn btn-outline btn-sm" onclick="runQuery('system')">System</button>
+                    <button class="btn btn-outline btn-sm" onclick="runQuery('meter')">Meter</button>
+                    <button class="btn btn-outline btn-sm" onclick="runQuery('settings')">Settings</button>
+                    <button class="btn btn-outline btn-sm" onclick="runQuery('eco')">Eco</button>
+                </div>
+            </div>
+
+            <div class="net-section">
+                <h3 style="color:var(--danger)">Write Register</h3>
+                <div class="net-inline-form">
+                    <div class="field">
+                        <label>Register</label>
+                        <input type="number" id="query-register" placeholder="47511" style="min-width:100px">
+                    </div>
+                    <div class="field">
+                        <label>Value</label>
+                        <input type="number" id="query-value" placeholder="1" style="min-width:100px">
+                    </div>
+                    <button class="btn btn-danger btn-sm" onclick="runQueryWrite()">Write</button>
+                </div>
+            </div>
+
+            <div id="query-status" style="font-size:0.85rem;margin-bottom:0.5rem"></div>
+            <div class="log-box" id="query-output" style="min-height:120px">Click a button above to query the inverter.</div>
+        </div>
+
         <div class="actions" style="margin-top:1rem" id="main-save-actions">
             <button class="btn btn-primary" onclick="saveConfig()">Save &amp; Restart</button>
         </div>
@@ -737,9 +1182,10 @@ document.querySelectorAll('.tab').forEach(tab => {
         document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
         tab.classList.add('active');
         document.getElementById('tab-' + tab.dataset.tab).classList.add('active');
-        // Hide main save button on inverter tab (it has its own save)
+        // Hide main save button on inverter and query tabs (they have their own actions)
+        const t = tab.dataset.tab;
         document.getElementById('main-save-actions').style.display =
-            tab.dataset.tab === 'inverter' ? 'none' : 'flex';
+            (t === 'inverter' || t === 'query') ? 'none' : 'flex';
     });
 });
 
@@ -1240,11 +1686,428 @@ function renderSolarData(data) {
     return html;
 }
 
+// --- Network Diagnostics ---
+function refreshNetworkInfo() {
+    fetch('/api/network/info').then(r => r.json()).then(data => {
+        const el = document.getElementById('net-interfaces');
+        let html = '<table class="net-table"><tr><th>Interface</th><th>Address</th></tr>';
+        (data.interfaces || []).forEach(i => {
+            html += '<tr><td>' + i.name + '</td><td>' + i.address + '</td></tr>';
+        });
+        if (data.gateway) {
+            html += '<tr><td>Gateway</td><td>' + data.gateway + '</td></tr>';
+        }
+        if (data.hostname) {
+            html += '<tr><td>Hostname</td><td>' + data.hostname + '</td></tr>';
+        }
+        html += '</table>';
+        el.innerHTML = html;
+    }).catch(() => {
+        document.getElementById('net-interfaces').innerHTML =
+            '<span style="color:var(--danger)">Failed to load network info</span>';
+    });
+}
+
+function discoverInverters() {
+    const btn = document.getElementById('btn-discover');
+    const el = document.getElementById('net-discover-result');
+    btn.disabled = true;
+    btn.textContent = 'Scanning...';
+    el.innerHTML = '<span class="info">Broadcasting UDP discovery...</span>';
+    fetch('/api/network/discover', { method: 'POST' })
+        .then(r => r.json()).then(data => {
+            btn.disabled = false;
+            btn.textContent = 'Scan Network';
+            if (data.error) {
+                el.innerHTML = '<span class="fail">' + data.error + '</span>';
+                return;
+            }
+            const invs = data.inverters || [];
+            if (!invs.length) {
+                el.innerHTML = '<span class="info">No inverters found on the network</span>';
+                return;
+            }
+            let html = '<table class="net-table"><tr><th>IP</th><th>Serial</th><th>MAC</th></tr>';
+            invs.forEach(i => {
+                html += '<tr><td>' + (i.ip || '\u2014') + '</td><td>' +
+                    (i.serial || '\u2014') + '</td><td>' + (i.mac || '\u2014') + '</td></tr>';
+            });
+            html += '</table>';
+            el.innerHTML = html;
+        }).catch(() => {
+            btn.disabled = false;
+            btn.textContent = 'Scan Network';
+            el.innerHTML = '<span class="fail">Discovery failed</span>';
+        });
+}
+
+function runPing() {
+    const host = document.getElementById('ping-host').value.trim();
+    const btn = document.getElementById('btn-ping');
+    const el = document.getElementById('net-ping-result');
+    if (!host) { el.innerHTML = '<span class="fail">Enter a host</span>'; return; }
+    btn.disabled = true;
+    btn.textContent = 'Pinging...';
+    el.innerHTML = '<span class="info">Pinging ' + host + '...</span>';
+    fetch('/api/network/ping', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ host: host })
+    }).then(r => r.json()).then(data => {
+        btn.disabled = false;
+        btn.textContent = 'Ping';
+        if (data.error) {
+            el.innerHTML = '<span class="fail">' + data.error + '</span>';
+            return;
+        }
+        const status = data.reachable
+            ? '<span class="ok">Reachable</span>'
+            : '<span class="fail">Unreachable</span>';
+        el.innerHTML = status + '<div class="net-output">' + (data.output || '') + '</div>';
+    }).catch(() => {
+        btn.disabled = false;
+        btn.textContent = 'Ping';
+        el.innerHTML = '<span class="fail">Request failed</span>';
+    });
+}
+
+function runPortTest() {
+    const host = document.getElementById('port-host').value.trim();
+    const port = document.getElementById('port-port').value.trim();
+    const proto = document.getElementById('port-proto').value;
+    const btn = document.getElementById('btn-port');
+    const el = document.getElementById('net-port-result');
+    if (!host || !port) { el.innerHTML = '<span class="fail">Enter host and port</span>'; return; }
+    btn.disabled = true;
+    btn.textContent = 'Testing...';
+    el.innerHTML = '<span class="info">Testing ' + proto.toUpperCase() + ' ' + host + ':' + port + '...</span>';
+    fetch('/api/network/test-port', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ host: host, port: parseInt(port), protocol: proto })
+    }).then(r => r.json()).then(data => {
+        btn.disabled = false;
+        btn.textContent = 'Test';
+        if (data.error) {
+            el.innerHTML = '<span class="fail">' + data.error + '</span>';
+            return;
+        }
+        const status = data.open
+            ? '<span class="ok">Open</span>'
+            : '<span class="fail">Closed</span>';
+        el.innerHTML = status + ' <span class="info">(' + data.protocol.toUpperCase() +
+            ' \u2014 ' + (data.detail || '') + ')</span>';
+    }).catch(() => {
+        btn.disabled = false;
+        btn.textContent = 'Test';
+        el.innerHTML = '<span class="fail">Request failed</span>';
+    });
+}
+
+// --- WiFi ---
+function scanWifi() {
+    const btn = document.getElementById('btn-wifi-scan');
+    const el = document.getElementById('wifi-scan-result');
+    btn.disabled = true;
+    btn.textContent = 'Scanning...';
+    el.innerHTML = '<span class="info">Scanning for WiFi networks...</span>';
+    fetch('/api/network/wifi/scan').then(r => r.json()).then(data => {
+        btn.disabled = false;
+        btn.textContent = 'Scan Networks';
+        if (data.error) {
+            el.innerHTML = '<span class="fail">' + data.error + '</span>';
+            return;
+        }
+        const cur = data.current || '';
+        const curEl = document.getElementById('wifi-current');
+        curEl.innerHTML = cur ? 'Connected to <strong>' + cur + '</strong>' : 'Not connected';
+        const nets = data.networks || [];
+        if (!nets.length) {
+            el.innerHTML = '<span class="info">No networks found</span>';
+            return;
+        }
+        let html = '<table class="net-table"><tr><th>SSID</th><th>Signal</th><th>Security</th><th></th></tr>';
+        nets.forEach(n => {
+            const pct = Math.max(0, Math.min(100, n.signal));
+            const color = pct >= 60 ? 'var(--success)' : pct >= 30 ? 'var(--warning)' : 'var(--danger)';
+            const isCurrent = n.ssid === cur;
+            html += '<tr><td>' + n.ssid + (isCurrent ? ' <span class="badge badge-active" style="font-size:0.7rem">connected</span>' : '') +
+                '</td><td><span class="wifi-signal"><span class="wifi-signal-fill" style="width:' + pct +
+                '%;background:' + color + '"></span></span> ' + pct + '%</td><td>' + (n.security || 'Open') +
+                '</td><td>' + (isCurrent ? '' : '<button class="btn btn-outline btn-sm" onclick="connectWifi(\'' +
+                n.ssid.replace(/'/g, "\\'") + '\',this)">Connect</button>') + '</td></tr>' +
+                '<tr class="wifi-pw-row" id="wifi-pw-' + n.ssid.replace(/[^a-zA-Z0-9]/g, '_') +
+                '" style="display:none"><td colspan="4"><div class="wifi-password-row">' +
+                '<input type="password" placeholder="Password" class="wifi-pw-input">' +
+                '<button class="btn btn-primary btn-sm wifi-pw-btn" onclick="doWifiConnect(\'' +
+                n.ssid.replace(/'/g, "\\'") + '\',this)">Join</button>' +
+                '<span class="wifi-status"></span></div></td></tr>';
+        });
+        html += '</table>';
+        el.innerHTML = html;
+    }).catch(() => {
+        btn.disabled = false;
+        btn.textContent = 'Scan Networks';
+        el.innerHTML = '<span class="fail">Scan failed</span>';
+    });
+}
+
+function connectWifi(ssid, btn) {
+    // Toggle password row visibility
+    const rowId = 'wifi-pw-' + ssid.replace(/[^a-zA-Z0-9]/g, '_');
+    const row = document.getElementById(rowId);
+    if (row) {
+        const visible = row.style.display !== 'none';
+        // Hide all other open password rows
+        document.querySelectorAll('.wifi-pw-row').forEach(r => r.style.display = 'none');
+        if (!visible) {
+            row.style.display = '';
+            row.querySelector('.wifi-pw-input').focus();
+        }
+    }
+}
+
+function doWifiConnect(ssid, btn) {
+    const row = btn.closest('.wifi-password-row');
+    const pwInput = row.querySelector('.wifi-pw-input');
+    const statusEl = row.querySelector('.wifi-status');
+    const password = pwInput.value;
+    btn.disabled = true;
+    btn.textContent = 'Connecting...';
+    statusEl.innerHTML = '';
+    fetch('/api/network/wifi/connect', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ ssid: ssid, password: password })
+    }).then(r => r.json().then(d => ({ok: r.ok, data: d}))).then(({ok, data}) => {
+        btn.disabled = false;
+        btn.textContent = 'Join';
+        if (ok && data.ok) {
+            statusEl.innerHTML = '<span class="ok">Connected!</span>';
+            showToast('Connected to ' + ssid, 'success');
+            setTimeout(() => { scanWifi(); refreshNetworkInfo(); }, 2000);
+        } else {
+            statusEl.innerHTML = '<span class="fail">' + (data.error || 'Failed') + '</span>';
+        }
+    }).catch(() => {
+        btn.disabled = false;
+        btn.textContent = 'Join';
+        statusEl.innerHTML = '<span class="fail">Request failed</span>';
+    });
+}
+
+// --- Query Tool ---
+let qtInverters = [];
+
+function qtLoadInverters() {
+    fetch('/api/goodwe/config').then(r => r.json()).then(data => {
+        qtInverters = data.inverters || [];
+        qtRenderList();
+        qtRenderTarget();
+    }).catch(() => {});
+}
+
+function qtRenderList() {
+    const el = document.getElementById('qt-inverter-list');
+    if (!qtInverters.length) {
+        el.innerHTML = '<span style="color:var(--muted);font-size:0.85rem">No inverters configured. Add one below.</span>';
+        return;
+    }
+    let html = '<table class="net-table"><tr><th>ID</th><th>Name</th><th>Host</th><th>Port</th><th></th></tr>';
+    qtInverters.forEach((inv, i) => {
+        html += '<tr><td>' + (inv.id || i) + '</td><td>' + (inv.name || '\u2014') +
+            '</td><td>' + (inv.host || '\u2014') + '</td><td>' + (inv.port || 8899) +
+            '</td><td><button class="btn btn-outline btn-sm" style="color:var(--danger);border-color:var(--danger);padding:0.15rem 0.5rem;font-size:0.75rem" ' +
+            'onclick="qtRemoveInverter(' + i + ')">\u00d7</button></td></tr>';
+    });
+    html += '</table>';
+    el.innerHTML = html;
+}
+
+function qtRenderTarget() {
+    const sel = document.getElementById('qt-target');
+    const prev = sel.value;
+    sel.innerHTML = '';
+    if (!qtInverters.length) {
+        sel.innerHTML = '<option value="">No inverters</option>';
+        return;
+    }
+    qtInverters.forEach(inv => {
+        const label = (inv.name || inv.host || 'Inverter') + ' (' + inv.id + ')';
+        sel.innerHTML += '<option value="' + inv.id + '">' + label + '</option>';
+    });
+    if (prev) sel.value = prev;
+}
+
+function qtAddInverter() {
+    const host = document.getElementById('qt-add-host').value.trim();
+    const port = document.getElementById('qt-add-port').value.trim() || '8899';
+    const name = document.getElementById('qt-add-name').value.trim();
+    if (!host) { showToast('Enter an IP address', 'error'); return; }
+    const id = String(qtInverters.length);
+    qtInverters.push({ id: id, name: name, host: host, port: parseInt(port) });
+    document.getElementById('qt-add-host').value = '';
+    document.getElementById('qt-add-name').value = '';
+    qtRenderList();
+    qtRenderTarget();
+}
+
+function qtRemoveInverter(idx) {
+    qtInverters.splice(idx, 1);
+    // Re-number IDs
+    qtInverters.forEach((inv, i) => inv.id = String(i));
+    qtRenderList();
+    qtRenderTarget();
+}
+
+function qtSaveInverters() {
+    fetch('/api/goodwe/config').then(r => r.json()).then(existing => {
+        const payload = {
+            inverters: qtInverters,
+            request_topic: existing.request_topic || 'goodwe/request',
+            response_topic: existing.response_topic || 'goodwe/response',
+            poll_interval: existing.poll_interval || 30,
+        };
+        return fetch('/api/goodwe/config', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify(payload)
+        });
+    }).then(r => r.json()).then(data => {
+        if (data.ok) {
+            showToast('Inverters saved', 'success');
+            // Sync the Inverter config tab too
+            loadInverterConfig();
+        } else {
+            showToast('Error: ' + (data.error || 'Save failed'), 'error');
+        }
+    }).catch(() => showToast('Save failed', 'error'));
+}
+
+function qtDiscover() {
+    const btn = document.getElementById('btn-qt-discover');
+    const el = document.getElementById('qt-discover-result');
+    btn.disabled = true;
+    btn.textContent = 'Scanning...';
+    el.innerHTML = '<span class="info">Broadcasting UDP discovery...</span>';
+    fetch('/api/network/discover', { method: 'POST' })
+        .then(r => r.json()).then(data => {
+            btn.disabled = false;
+            btn.textContent = 'Discover';
+            if (data.error) {
+                el.innerHTML = '<span class="fail">' + data.error + '</span>';
+                return;
+            }
+            const invs = data.inverters || [];
+            if (!invs.length) {
+                el.innerHTML = '<span class="info">No inverters found on the network</span>';
+                return;
+            }
+            let html = '<table class="net-table"><tr><th>IP</th><th>Serial</th><th>MAC</th><th></th></tr>';
+            invs.forEach(inv => {
+                const ip = inv.ip || '';
+                const already = qtInverters.some(q => q.host === ip);
+                html += '<tr><td>' + (ip || '\u2014') + '</td><td>' +
+                    (inv.serial || '\u2014') + '</td><td>' + (inv.mac || '\u2014') + '</td><td>' +
+                    (already ? '<span style="color:var(--success);font-size:0.8rem">added</span>'
+                    : '<button class="btn btn-outline btn-sm" style="padding:0.15rem 0.5rem;font-size:0.75rem" ' +
+                      'onclick="qtAddDiscovered(\'' + ip + '\',\'' + (inv.serial || '') + '\')">+ Add</button>') +
+                    '</td></tr>';
+            });
+            html += '</table>';
+            el.innerHTML = html;
+        }).catch(() => {
+            btn.disabled = false;
+            btn.textContent = 'Discover';
+            el.innerHTML = '<span class="fail">Discovery failed</span>';
+        });
+}
+
+function qtAddDiscovered(ip, serial) {
+    const id = String(qtInverters.length);
+    qtInverters.push({ id: id, name: serial || '', host: ip, port: 8899 });
+    qtRenderList();
+    qtRenderTarget();
+    // Re-render discover results to update "added" state
+    const el = document.getElementById('qt-discover-result');
+    if (el.querySelector('table')) qtDiscover();
+}
+
+function getQueryTarget() {
+    const sel = document.getElementById('qt-target');
+    return sel ? sel.value : '';
+}
+
+function runQuery(command) {
+    const target = getQueryTarget();
+    if (!target) { showToast('Add an inverter first', 'error'); return; }
+    const statusEl = document.getElementById('query-status');
+    const outputEl = document.getElementById('query-output');
+    statusEl.innerHTML = '<span style="color:var(--muted)">Running ' + command + '...</span>';
+    outputEl.textContent = 'Querying inverter...';
+    fetch('/api/goodwe/query', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ command: command, inverter_id: target })
+    }).then(r => r.json()).then(data => {
+        if (data.error) {
+            statusEl.innerHTML = '<span style="color:var(--danger)">' + data.error + '</span>';
+            outputEl.textContent = data.error;
+        } else {
+            const ok = data.exit_code === 0;
+            statusEl.innerHTML = '<span style="color:' + (ok ? 'var(--success)' : 'var(--danger)') + '">' +
+                (ok ? 'Done' : 'Exited with code ' + data.exit_code) + '</span>';
+            outputEl.textContent = data.output || '(no output)';
+        }
+    }).catch(() => {
+        statusEl.innerHTML = '<span style="color:var(--danger)">Request failed</span>';
+        outputEl.textContent = 'Failed to reach the server.';
+    });
+}
+
+function runQueryWrite() {
+    const target = getQueryTarget();
+    if (!target) { showToast('Add an inverter first', 'error'); return; }
+    const reg = document.getElementById('query-register').value.trim();
+    const val = document.getElementById('query-value').value.trim();
+    if (!reg || !val) {
+        showToast('Enter register and value', 'error');
+        return;
+    }
+    if (!confirm('Write value ' + val + ' to register ' + reg + '?\n\nThis modifies inverter settings and can affect system behaviour. Continue?')) {
+        return;
+    }
+    const statusEl = document.getElementById('query-status');
+    const outputEl = document.getElementById('query-output');
+    statusEl.innerHTML = '<span style="color:var(--muted)">Writing register ' + reg + '...</span>';
+    outputEl.textContent = 'Writing to inverter...';
+    fetch('/api/goodwe/query', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ command: 'write', register: reg, value: val, inverter_id: target })
+    }).then(r => r.json()).then(data => {
+        if (data.error) {
+            statusEl.innerHTML = '<span style="color:var(--danger)">' + data.error + '</span>';
+            outputEl.textContent = data.error;
+        } else {
+            const ok = data.exit_code === 0;
+            statusEl.innerHTML = '<span style="color:' + (ok ? 'var(--success)' : 'var(--danger)') + '">' +
+                (ok ? 'Write complete' : 'Exited with code ' + data.exit_code) + '</span>';
+            outputEl.textContent = data.output || '(no output)';
+        }
+    }).catch(() => {
+        statusEl.innerHTML = '<span style="color:var(--danger)">Request failed</span>';
+        outputEl.textContent = 'Failed to reach the server.';
+    });
+}
+
 // --- Init ---
 refreshStatus();
 loadConfig();
 loadInverterConfig();
+qtLoadInverters();
 refreshSolar();
+refreshNetworkInfo();
 // Auto-refresh every 30s
 setInterval(refreshStatus, 30000);
 setInterval(refreshSolar, 30000);

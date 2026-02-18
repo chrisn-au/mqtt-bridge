@@ -34,7 +34,7 @@ if command -v jq &>/dev/null; then
     MQTT_TLS=$(jq -r '.mqtt.tls // false' "$CONFIG")
     REQ_TOPIC=$(jq -r '.request_topic // "goodwe/request"' "$CONFIG")
     RESP_TOPIC=$(jq -r '.response_topic // "goodwe/response"' "$CONFIG")
-    INV_ID=$(jq -r '.inverters[0].id // "0"' "$CONFIG")
+    INV_ID="${GOODWE_INV_ID:-$(jq -r '.inverters[0].id // "0"' "$CONFIG")}"
 elif command -v python3 &>/dev/null; then
     eval "$(python3 -c "
 import json, sys
@@ -50,6 +50,7 @@ print(f'RESP_TOPIC=\"{c.get(\"response_topic\", \"goodwe/response\")}\"')
 inv = c.get('inverters', [{}])
 print(f'INV_ID=\"{inv[0].get(\"id\", \"0\") if inv else \"0\"}\"')
 ")"
+    INV_ID="${GOODWE_INV_ID:-$INV_ID}"
 else
     echo "ERROR: Need jq or python3 to parse config."
     exit 1
