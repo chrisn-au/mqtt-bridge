@@ -954,6 +954,7 @@ btn, .btn { display: inline-block; padding: 0.5rem 1rem; border: none; border-ra
             <div id="net-discover-result" class="net-result"></div>
         </div>
 
+        <!-- Escea Fireplace Discovery (hidden — uncomment when needed)
         <div class="net-section">
             <h3>Escea Fireplace Discovery</h3>
             <div class="net-inline-form">
@@ -961,6 +962,7 @@ btn, .btn { display: inline-block; padding: 0.5rem 1rem; border: none; border-ra
             </div>
             <div id="net-escea-result" class="net-result"></div>
         </div>
+        -->
 
         <div class="net-section">
             <h3>Ping Test</h3>
