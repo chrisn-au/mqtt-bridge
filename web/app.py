@@ -522,6 +522,53 @@ def api_network_discover():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/network/discover-escea", methods=["POST"])
+def api_discover_escea():
+    """Broadcast UDP to discover Escea fireplaces on the local network."""
+    import socket as _socket
+    import struct as _struct
+    try:
+        # Build 15-byte SEARCH_FOR_FIRES message
+        msg = bytearray(15)
+        msg[0] = 0x47   # start byte
+        msg[1] = 0x50   # SEARCH_FOR_FIRES
+        msg[2] = 0x00   # data length
+        # bytes 3-12 are zero (no data)
+        msg[13] = sum(msg[1:13]) % 256  # CRC
+        msg[14] = 0x46  # end byte
+
+        sock = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
+        sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_BROADCAST, 1)
+        sock.settimeout(4)
+        sock.sendto(bytes(msg), ("255.255.255.255", 3300))
+
+        results = []
+        seen = set()
+        while True:
+            try:
+                data, addr = sock.recvfrom(1024)
+            except _socket.timeout:
+                break
+            ip = addr[0]
+            if ip in seen or len(data) < 15:
+                continue
+            # Validate: start=0x47, end=0x46, response=I_AM_A_FIRE(0x90)
+            if data[0] != 0x47 or data[14] != 0x46 or data[1] != 0x90:
+                continue
+            seen.add(ip)
+            serial = _struct.unpack(">I", data[3:7])[0]
+            pin = _struct.unpack(">H", data[7:9])[0]
+            results.append({
+                "ip": ip,
+                "serial": str(serial),
+                "pin": str(pin),
+            })
+        sock.close()
+        return jsonify({"fireplaces": results})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/network/ping", methods=["POST"])
 def api_network_ping():
     """Ping a host (no shell injection — uses list args)."""
@@ -905,6 +952,14 @@ btn, .btn { display: inline-block; padding: 0.5rem 1rem; border: none; border-ra
                 <button class="btn btn-primary btn-sm" onclick="discoverInverters()" id="btn-discover">Scan Network</button>
             </div>
             <div id="net-discover-result" class="net-result"></div>
+        </div>
+
+        <div class="net-section">
+            <h3>Escea Fireplace Discovery</h3>
+            <div class="net-inline-form">
+                <button class="btn btn-primary btn-sm" onclick="discoverEscea()" id="btn-escea-discover">Scan Network</button>
+            </div>
+            <div id="net-escea-result" class="net-result"></div>
         </div>
 
         <div class="net-section">
@@ -1731,6 +1786,39 @@ function discoverInverters() {
             invs.forEach(i => {
                 html += '<tr><td>' + (i.ip || '\u2014') + '</td><td>' +
                     (i.serial || '\u2014') + '</td><td>' + (i.mac || '\u2014') + '</td></tr>';
+            });
+            html += '</table>';
+            el.innerHTML = html;
+        }).catch(() => {
+            btn.disabled = false;
+            btn.textContent = 'Scan Network';
+            el.innerHTML = '<span class="fail">Discovery failed</span>';
+        });
+}
+
+function discoverEscea() {
+    const btn = document.getElementById('btn-escea-discover');
+    const el = document.getElementById('net-escea-result');
+    btn.disabled = true;
+    btn.textContent = 'Scanning...';
+    el.innerHTML = '<span class="info">Broadcasting Escea discovery on UDP 3300...</span>';
+    fetch('/api/network/discover-escea', { method: 'POST' })
+        .then(r => r.json()).then(data => {
+            btn.disabled = false;
+            btn.textContent = 'Scan Network';
+            if (data.error) {
+                el.innerHTML = '<span class="fail">' + data.error + '</span>';
+                return;
+            }
+            const fires = data.fireplaces || [];
+            if (!fires.length) {
+                el.innerHTML = '<span class="info">No Escea fireplaces found on the network</span>';
+                return;
+            }
+            let html = '<table class="net-table"><tr><th>IP</th><th>Serial</th><th>PIN</th></tr>';
+            fires.forEach(f => {
+                html += '<tr><td>' + (f.ip || '\u2014') + '</td><td>' +
+                    (f.serial || '\u2014') + '</td><td>' + (f.pin || '\u2014') + '</td></tr>';
             });
             html += '</table>';
             el.innerHTML = html;
