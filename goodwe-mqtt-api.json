@@ -1,0 +1,223 @@
+{
+  "version": "1.0",
+  "protocol": "mqtt",
+  "description": "GoodWe Solar Inverter MQTT Bridge API",
+  "connection": {
+    "request_topic": "goodwe/request/{bridge_id}",
+    "response_topic": "goodwe/response/{bridge_id}",
+    "note": "bridge_id is 1 or 2 depending on which Pi/bridge"
+  },
+  "request_format": "<COOKIE> <INVERTER_ID> <COMMAND> [ARGS...]",
+  "response_format": {
+    "success": "<COOKIE> OK <data...>",
+    "error": "<COOKIE> ERR <message>"
+  },
+  "commands": {
+    "info": {
+      "description": "Query inverter model, serial number, and family",
+      "request": "<COOKIE> <INVERTER_ID> info",
+      "response_fields": {
+        "model": {"type": "string", "description": "Inverter model name", "example": "GW5048D-ES"},
+        "serial": {"type": "string", "description": "Inverter serial number", "example": "95048ESU223W0259"},
+        "family": {"type": "string", "description": "Inverter protocol family", "example": "ES", "values": ["ES", "DT", "ET"]}
+      },
+      "example_request": "10001 0 info",
+      "example_response": "10001 OK model=GW5048D-ES serial=95048ESU223W0259 family=ES"
+    },
+    "pv": {
+      "description": "Query PV solar panel data",
+      "request": "<COOKIE> <INVERTER_ID> pv",
+      "response_fields": {
+        "vpv1":           {"type": "float",  "unit": "V",  "description": "PV1 Voltage"},
+        "ipv1":           {"type": "float",  "unit": "A",  "description": "PV1 Current"},
+        "ppv1":           {"type": "int",    "unit": "W",  "description": "PV1 Power"},
+        "pv1_mode":       {"type": "int",    "unit": "",   "description": "PV1 Mode code", "values": {"0": "Not connected", "1": "Connected, no power", "2": "Connected, producing"}},
+        "pv1_mode_label": {"type": "string", "unit": "",   "description": "PV1 Mode human-readable label"},
+        "vpv2":           {"type": "float",  "unit": "V",  "description": "PV2 Voltage"},
+        "ipv2":           {"type": "float",  "unit": "A",  "description": "PV2 Current"},
+        "ppv2":           {"type": "int",    "unit": "W",  "description": "PV2 Power"},
+        "pv2_mode":       {"type": "int",    "unit": "",   "description": "PV2 Mode code"},
+        "pv2_mode_label": {"type": "string", "unit": "",   "description": "PV2 Mode human-readable label"},
+        "ppv":            {"type": "int",    "unit": "W",  "description": "Total PV Power (PV1 + PV2)"}
+      },
+      "example_request": "10002 0 pv",
+      "example_response": "10002 OK vpv1=382.80 ipv1=2.00 ppv1=766 pv1_mode=1 pv1_mode_label=PV_panels_connected,_no_power vpv2=0.00 ipv2=0.10 ppv2=0 pv2_mode=0 ppv=766"
+    },
+    "battery": {
+      "description": "Query battery data (ES/EM/BP family only)",
+      "request": "<COOKIE> <INVERTER_ID> battery",
+      "response_fields": {
+        "vbattery1":               {"type": "float", "unit": "V",  "description": "Battery Voltage", "range": "40-60"},
+        "ibattery1":               {"type": "float", "unit": "A",  "description": "Battery Current (negative = charging)", "range": "-100 to 100"},
+        "pbattery1":               {"type": "int",   "unit": "W",  "description": "Battery Power (negative = charging)"},
+        "battery_mode":            {"type": "int",   "unit": "",   "description": "Battery Mode code", "values": {"1": "Standby", "2": "Discharge", "3": "Charge", "4": "Off"}},
+        "battery_mode_label":      {"type": "string","unit": "",   "description": "Battery Mode human-readable label"},
+        "battery_soc":             {"type": "int",   "unit": "%",  "description": "Battery State of Charge", "range": "0-100"},
+        "battery_soh":             {"type": "int",   "unit": "%",  "description": "Battery State of Health", "range": "0-100"},
+        "battery_temperature":     {"type": "float", "unit": "C",  "description": "Battery Temperature"},
+        "battery_status":          {"type": "int",   "unit": "",   "description": "Battery Status code"},
+        "battery_charge_limit":    {"type": "int",   "unit": "A",  "description": "Battery Charge Limit"},
+        "battery_discharge_limit": {"type": "int",   "unit": "A",  "description": "Battery Discharge Limit"},
+        "battery_error":           {"type": "int",   "unit": "",   "description": "Battery Error Code (0 = no error)"},
+        "battery_warning":         {"type": "int",   "unit": "",   "description": "Battery Warning Code (0 = no warning)"}
+      },
+      "example_request": "10003 0 battery",
+      "example_response": "10003 OK vbattery1=49.30 ibattery1=-9.30 pbattery1=-458 battery_mode=3 battery_mode_label=Charge battery_soc=11 battery_soh=96 battery_temperature=25.20 battery_status=80 battery_charge_limit=101 battery_discharge_limit=101 battery_error=0 battery_warning=0"
+    },
+    "grid": {
+      "description": "Query grid and load data",
+      "request": "<COOKIE> <INVERTER_ID> grid",
+      "response_fields": {
+        "vgrid":              {"type": "float",  "unit": "V",  "description": "On-grid Voltage"},
+        "igrid":              {"type": "float",  "unit": "A",  "description": "On-grid Current"},
+        "pgrid":              {"type": "int",    "unit": "W",  "description": "On-grid Export Power (negative = importing)"},
+        "fgrid":              {"type": "float",  "unit": "Hz", "description": "On-grid Frequency"},
+        "grid_mode":          {"type": "int",    "unit": "",   "description": "Grid Mode code", "values": {"0": "Inverter Off", "1": "Inverter On"}},
+        "grid_mode_label":    {"type": "string", "unit": "",   "description": "Grid Mode label"},
+        "vload":              {"type": "float",  "unit": "V",  "description": "Back-up/Load Voltage"},
+        "iload":              {"type": "float",  "unit": "A",  "description": "Back-up/Load Current"},
+        "pload":              {"type": "int",    "unit": "W",  "description": "On-grid Power"},
+        "fload":              {"type": "float",  "unit": "Hz", "description": "Back-up Frequency"},
+        "load_mode":          {"type": "int",    "unit": "",   "description": "Load Mode code"},
+        "load_mode_label":    {"type": "string", "unit": "",   "description": "Load Mode label"},
+        "meter_status":       {"type": "int",    "unit": "",   "description": "Meter Status code"},
+        "grid_in_out":        {"type": "int",    "unit": "",   "description": "Grid import/export mode code", "values": {"0": "Idle", "1": "Exporting", "2": "Importing"}},
+        "grid_in_out_label":  {"type": "string", "unit": "",   "description": "Grid import/export label"},
+        "pback_up":           {"type": "int",    "unit": "W",  "description": "Back-up Power"},
+        "plant_power":        {"type": "int",    "unit": "W",  "description": "Total Plant Power"},
+        "house_consumption":  {"type": "int",    "unit": "W",  "description": "House Consumption"},
+        "meter_power_factor": {"type": "float",  "unit": "",   "description": "Meter Power Factor"}
+      },
+      "example_request": "10004 0 grid",
+      "example_response": "10004 OK vgrid=242.20 igrid=0.60 pgrid=4 fgrid=49.95 grid_mode=1 grid_mode_label=Inverter_On vload=242.20 iload=2.50 pload=396 fload=49.95 load_mode=1 meter_status=1 grid_in_out=0 grid_in_out_label=Idle pback_up=515 plant_power=911 house_consumption=304 meter_power_factor=0.00"
+    },
+    "energy": {
+      "description": "Query energy generation and consumption totals",
+      "request": "<COOKIE> <INVERTER_ID> energy",
+      "response_fields": {
+        "e_day":        {"type": "float", "unit": "kWh", "description": "Today's PV Generation"},
+        "e_total":      {"type": "float", "unit": "kWh", "description": "Total PV Generation (lifetime)"},
+        "h_total":      {"type": "int",   "unit": "h",   "description": "Total Hours of operation"},
+        "e_load_day":   {"type": "float", "unit": "kWh", "description": "Today's Load consumption"},
+        "e_load_total": {"type": "float", "unit": "kWh", "description": "Total Load consumption (lifetime)"},
+        "total_power":  {"type": "int",   "unit": "W",   "description": "Current Total Power"}
+      },
+      "example_request": "10005 0 energy",
+      "example_response": "10005 OK e_day=0.20 e_total=21286.90 h_total=27432 e_load_day=46.80 e_load_total=62965.70 total_power=85"
+    },
+    "system": {
+      "description": "Query system status, work mode, errors, and diagnostics",
+      "request": "<COOKIE> <INVERTER_ID> system",
+      "response_fields": {
+        "work_mode":              {"type": "int",    "unit": "", "description": "Energy Mode code", "values": {"0": "Wait", "1": "Normal (Off-Grid)", "2": "Normal (On-Grid)", "3": "Fault", "4": "Flash", "5": "Check"}},
+        "work_mode_label":        {"type": "string", "unit": "", "description": "Energy Mode label"},
+        "temperature":            {"type": "float",  "unit": "C","description": "Inverter Temperature"},
+        "error_codes":            {"type": "int",    "unit": "", "description": "Error Code bitfield (0 = no errors)"},
+        "effective_work_mode":    {"type": "int",    "unit": "", "description": "Effective Work Mode code"},
+        "effective_relay_control": {"type": "int",   "unit": "", "description": "Effective Relay Control"},
+        "diagnose_result":        {"type": "int",    "unit": "", "description": "Diagnostic Status Code (bitfield)"},
+        "diagnose_result_label":  {"type": "string", "unit": "", "description": "Diagnostic Status human-readable"}
+      },
+      "example_request": "10006 0 system",
+      "example_response": "10006 OK work_mode=2 work_mode_label=Normal_(On-Grid) temperature=27.10 error_codes=0 effective_work_mode=1 effective_relay_control=48 diagnose_result=524294 diagnose_result_label=Battery_SOC_low,_Battery_SOC_in_back,_Self-use_off"
+    },
+    "all": {
+      "description": "Query all runtime sensor data in one request",
+      "request": "<COOKIE> <INVERTER_ID> all",
+      "note": "Returns all fields from pv + battery + grid + energy + system combined",
+      "example_request": "10007 0 all"
+    },
+    "settings": {
+      "description": "Query inverter configuration settings (read-only via this command)",
+      "request": "<COOKIE> <INVERTER_ID> settings",
+      "response_fields": {
+        "backup_supply":         {"type": "int",   "unit": "",  "description": "Backup supply enabled", "values": {"0": "Disabled", "1": "Enabled"}},
+        "off-grid_charge":       {"type": "int",   "unit": "",  "description": "Off-grid charging enabled", "values": {"0": "Disabled", "1": "Enabled"}},
+        "shadow_scan":           {"type": "int",   "unit": "",  "description": "Shadow scan enabled", "values": {"0": "Disabled", "1": "Enabled"}},
+        "grid_export":           {"type": "int",   "unit": "",  "description": "Grid export limit enabled", "values": {"0": "Disabled", "1": "Enabled"}},
+        "capacity":              {"type": "int",   "unit": "Ah","description": "Battery capacity"},
+        "charge_v":              {"type": "float", "unit": "V", "description": "Battery charge voltage"},
+        "charge_i":              {"type": "int",   "unit": "A", "description": "Battery charge current limit"},
+        "discharge_i":           {"type": "int",   "unit": "A", "description": "Battery discharge current limit"},
+        "discharge_v":           {"type": "float", "unit": "V", "description": "Battery discharge cutoff voltage"},
+        "dod":                   {"type": "int",   "unit": "%", "description": "Depth of Discharge", "range": "0-100"},
+        "battery_activated":     {"type": "int",   "unit": "",  "description": "Battery activated", "values": {"0": "No", "1": "Yes"}},
+        "power_factor":          {"type": "int",   "unit": "",  "description": "Power factor (x100)"},
+        "grid_export_limit":     {"type": "int",   "unit": "W", "description": "Grid export power limit"},
+        "battery_soc_protection":{"type": "int",   "unit": "%", "description": "Battery SOC protection level"},
+        "work_mode":             {"type": "int",   "unit": "",  "description": "Work mode setting", "values": {"0": "General", "1": "Off-grid", "2": "Backup", "3": "Eco"}},
+        "eco_mode_1":            {"type": "string","unit": "",  "description": "Eco mode schedule group 1"},
+        "eco_mode_1_switch":     {"type": "int",   "unit": "",  "description": "Eco mode group 1 on/off"},
+        "eco_mode_2":            {"type": "string","unit": "",  "description": "Eco mode schedule group 2"},
+        "eco_mode_2_switch":     {"type": "int",   "unit": "",  "description": "Eco mode group 2 on/off"},
+        "eco_mode_3":            {"type": "string","unit": "",  "description": "Eco mode schedule group 3"},
+        "eco_mode_3_switch":     {"type": "int",   "unit": "",  "description": "Eco mode group 3 on/off"},
+        "eco_mode_4":            {"type": "string","unit": "",  "description": "Eco mode schedule group 4"},
+        "eco_mode_4_switch":     {"type": "int",   "unit": "",  "description": "Eco mode group 4 on/off"}
+      },
+      "example_request": "10008 0 settings",
+      "example_response": "10008 OK backup_supply=1 off-grid_charge=1 shadow_scan=0 grid_export=0 capacity=252 charge_v=57.70 charge_i=201 discharge_i=96 discharge_v=42.00 dod=90 battery_activated=0 power_factor=100 grid_export_limit=0 battery_soc_protection=0 work_mode=0"
+    },
+    "read_registers": {
+      "description": "Raw Modbus register read (use for settings registers that need direct access)",
+      "request": "<COOKIE> <INVERTER_ID> <FUNC> <REG> <COUNT>",
+      "parameters": {
+        "FUNC": {"type": "int", "description": "Modbus function code", "values": {"3": "Read holding registers", "4": "Read input registers"}},
+        "REG":  {"type": "int", "description": "Starting register address"},
+        "COUNT":{"type": "int", "description": "Number of registers to read (max 125)"}
+      },
+      "response": "Raw 16-bit unsigned register values, space-separated",
+      "example_request": "10009 0 3 45052 1",
+      "example_response": "10009 OK 5000",
+      "note": "For ES inverters, runtime data uses AA55 protocol internally. Use text commands (pv, battery, etc.) for reliable runtime reads. Raw register reads work for settings registers (45xxx, 47xxx)."
+    },
+    "write_single": {
+      "description": "Write a single Modbus holding register",
+      "request": "<COOKIE> <INVERTER_ID> 6 <REG> 1 <VALUE>",
+      "parameters": {
+        "REG":  {"type": "int", "description": "Register address to write"},
+        "VALUE":{"type": "int", "description": "Value to write (16-bit unsigned, 0-65535)"}
+      },
+      "example_request": "10010 0 6 45052 1 5000",
+      "example_response": "10010 OK",
+      "writable_registers": {
+        "45012": {"name": "backup_supply",         "values": {"0": "Disabled", "1": "Enabled"}},
+        "45014": {"name": "off-grid_charge",       "values": {"0": "Disabled", "1": "Enabled"}},
+        "45016": {"name": "shadow_scan",           "values": {"0": "Disabled", "1": "Enabled"}},
+        "45018": {"name": "grid_export",           "values": {"0": "Disabled", "1": "Enabled"}},
+        "45022": {"name": "capacity",              "unit": "Ah"},
+        "45024": {"name": "charge_v",              "unit": "V x10"},
+        "45026": {"name": "charge_i",              "unit": "A"},
+        "45028": {"name": "discharge_i",           "unit": "A"},
+        "45030": {"name": "discharge_v",           "unit": "V x10"},
+        "45032": {"name": "dod",                   "unit": "%", "range": "0-100"},
+        "45034": {"name": "battery_activated",     "values": {"0": "No", "1": "Yes"}},
+        "45052": {"name": "grid_export_limit",     "unit": "W"},
+        "45056": {"name": "battery_soc_protection","unit": "%"},
+        "45066": {"name": "work_mode",             "values": {"0": "General", "1": "Off-grid", "2": "Backup", "3": "Eco"}}
+      },
+      "warning": "Writing incorrect values can affect inverter operation. Use with caution."
+    },
+    "write_multi": {
+      "description": "Write multiple consecutive Modbus holding registers",
+      "request": "<COOKIE> <INVERTER_ID> 16 <REG> <COUNT> <VAL1> <VAL2> ...",
+      "example_request": "10011 0 16 45024 2 577 201",
+      "example_response": "10011 OK",
+      "note": "Values are 16-bit unsigned integers. Count must match number of values."
+    }
+  },
+  "inverter_families": {
+    "ES": {
+      "models": ["GW5048D-ES", "GW5048-ES", "GW3648D-ES", "GW5048-EM", "GW5048D-EM", "BP series"],
+      "features": ["PV", "battery", "grid", "backup", "eco modes"],
+      "protocol": "AA55 (proprietary UDP)",
+      "note": "Hybrid inverter with battery. Runtime data uses AA55 protocol, settings use Modbus."
+    },
+    "DT": {
+      "models": ["GW5000D-NS", "GW6000-DT", "GW10K-MS", "GW5000-XS"],
+      "features": ["PV", "grid", "meter"],
+      "protocol": "Standard Modbus",
+      "note": "Grid-tied inverter, no battery. All data via standard Modbus registers."
+    }
+  }
+}

@@ -154,7 +154,7 @@ def validate_config(config):
 # ---------------------------------------------------------------------------
 
 def load_goodwe_config():
-    """Load GoodWe inverter configuration."""
+    """Load GoodWe inverter configuration (full file, including mqtt section)."""
     defaults = {
         "inverters": [],
         "poll_interval": 30,
@@ -170,7 +170,13 @@ def load_goodwe_config():
                 cfg["inverters"] = [{"id": "0", "host": cfg["host"], "port": cfg.get("port", 8899)}]
             else:
                 cfg["inverters"] = []
-        defaults.update({k: cfg[k] for k in defaults if k in cfg})
+        for k in defaults:
+            if k in cfg:
+                defaults[k] = cfg[k]
+        if "gateway_id" in cfg:
+            defaults["gateway_id"] = cfg["gateway_id"]
+        if "mqtt" in cfg:
+            defaults["mqtt"] = cfg["mqtt"]
     except (FileNotFoundError, json.JSONDecodeError):
         pass
     return defaults
@@ -379,12 +385,20 @@ def api_save_goodwe_config():
         }
         inverters.append(entry)
     poll_interval = int(data.get("poll_interval", 30))
+    # Preserve existing mqtt section when saving
+    existing = load_goodwe_config()
     config = {
         "inverters": inverters,
         "poll_interval": max(poll_interval, 5) if poll_interval > 0 else 0,
         "request_topic": data.get("request_topic", "goodwe/request").strip(),
         "response_topic": data.get("response_topic", "goodwe/response").strip(),
     }
+    if "mqtt" in existing:
+        config["mqtt"] = existing["mqtt"]
+    # Update gateway_id if provided
+    gw_id = (data.get("gateway_id") or "").strip()
+    if gw_id:
+        config["gateway_id"] = gw_id
     try:
         save_goodwe_config(config)
     except Exception as e:
@@ -1137,9 +1151,13 @@ btn, .btn { display: inline-block; padding: 0.5rem 1rem; border: none; border-ra
                 <div><label>Response Topic</label><input type="text" id="gw-response-topic" value="goodwe/response"></div>
             </div>
             <div class="form-row">
+                <div><label>Gateway ID</label><input type="text" id="gw-gateway-id" placeholder="defaults to hostname"></div>
                 <div><label>Poll Interval (seconds)</label><input type="text" id="gw-poll-interval" value="30" placeholder="30"></div>
-                <div></div>
             </div>
+            <p style="font-size:0.8rem;color:var(--muted);margin:-0.5rem 0 0.5rem">
+                Topics support <code>{gateway_id}</code> and <code>{client_id}</code> variables.
+                Client ID (MQTT tab) defaults to gateway ID if not set.
+            </p>
             <div class="actions">
                 <button class="btn btn-solar" onclick="saveInverterConfig()">Save Inverter Config</button>
             </div>
@@ -1609,6 +1627,7 @@ function collectInverters() {
 function loadInverterConfig() {
     fetch('/api/goodwe/config').then(r => r.json()).then(data => {
         renderInverters(data.inverters || []);
+        document.getElementById('gw-gateway-id').value = data.gateway_id || '';
         document.getElementById('gw-request-topic').value = data.request_topic || 'goodwe/request';
         document.getElementById('gw-response-topic').value = data.response_topic || 'goodwe/response';
         document.getElementById('gw-poll-interval').value = data.poll_interval || 30;
@@ -1619,11 +1638,13 @@ function saveInverterConfig() {
     const reqTopic = document.getElementById('gw-request-topic').value.trim() || 'goodwe/request';
     const resTopic = document.getElementById('gw-response-topic').value.trim() || 'goodwe/response';
     const pollInterval = document.getElementById('gw-poll-interval').value.trim() || '30';
+    const gatewayId = document.getElementById('gw-gateway-id').value.trim();
     fetch('/api/goodwe/config', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({
             inverters: collectInverters(),
+            gateway_id: gatewayId,
             request_topic: reqTopic, response_topic: resTopic,
             poll_interval: parseInt(pollInterval)
         })

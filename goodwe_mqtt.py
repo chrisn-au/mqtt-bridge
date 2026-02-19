@@ -19,6 +19,7 @@ import asyncio
 import json
 import logging
 import os
+import platform
 import signal
 import struct
 import sys
@@ -68,6 +69,19 @@ def load_goodwe_config():
         defaults.update({k: cfg[k] for k in defaults if k in cfg})
     except (FileNotFoundError, json.JSONDecodeError):
         pass
+
+    # Resolve gateway_id and substitute topic variables
+    gateway_id = defaults.get("gateway_id", "") or platform.node().split(".")[0]
+    defaults["gateway_id"] = gateway_id
+    mqtt_cfg = defaults.get("mqtt", {})
+    client_id = mqtt_cfg.get("client_id", "") or gateway_id
+    subs = {"gateway_id": gateway_id, "client_id": client_id}
+    for key in ("request_topic", "response_topic"):
+        try:
+            defaults[key] = defaults[key].format(**subs)
+        except (KeyError, ValueError):
+            pass
+
     return defaults
 
 
@@ -138,8 +152,8 @@ class GoodWeBridge:
         self.client = None
         self.lock = threading.Lock()
         self.poll_seq = 0
-        # Per-inverter cache: {inverter_id: [(start_reg, count), ...]}
-        self._poll_ranges = {}
+        # Cached inverter connections: {(host, port): inverter_object}
+        self._inverter_cache = {}
 
     def _get_inverter(self, inverter_id):
         """Look up inverter config by ID."""
@@ -148,10 +162,20 @@ class GoodWeBridge:
                 return inv
         return None
 
+    async def _connect(self, host, port):
+        """Get a cached inverter connection, reconnecting if needed."""
+        key = (host, port)
+        inv = self._inverter_cache.get(key)
+        if inv is None:
+            inv = await goodwe.connect(host, port=port)
+            self._inverter_cache[key] = inv
+            log.info("Connected to inverter at %s:%d (%s)", host, port,
+                     getattr(inv, "model_name", "unknown"))
+        return inv
+
     def setup_mqtt(self):
         """Set up and connect MQTT client."""
-        client_id = self.mqtt_config.get("client_id", "")
-        client_id = (client_id + "_gw") if client_id else "goodwe_bridge"
+        client_id = self.mqtt_config.get("client_id", "") or self.gw_config.get("gateway_id", "") or platform.node().split(".")[0]
 
         try:
             self.client = mqtt.Client(
@@ -223,11 +247,13 @@ class GoodWeBridge:
         log.info("Response: %s", result)
 
     async def _handle_request(self, payload):
-        """Parse and execute a register read/write request.
+        """Parse and execute a request.
 
         Formats:
             COOKIE INVERTER_ID FUNC REG COUNT [DATA...]   (register read/write)
             COOKIE INVERTER_ID info                        (device info query)
+            COOKIE INVERTER_ID pv|battery|grid|energy|system|all  (sensor query)
+            COOKIE INVERTER_ID settings                            (settings query)
         """
         parts = payload.split()
         if len(parts) < 3:
@@ -246,9 +272,14 @@ class GoodWeBridge:
         if not host:
             return f"{cookie} ERR inverter {inverter_id} has no host configured"
 
-        # Handle 'info' command
-        if parts[2].lower() == "info":
+        # Handle text commands
+        cmd = parts[2].lower()
+        if cmd == "info":
             return await self._device_info(host, port, cookie)
+        if cmd in ("pv", "battery", "grid", "energy", "system", "all"):
+            return await self._query_sensors(host, port, cookie, cmd)
+        if cmd == "settings":
+            return await self._query_settings(host, port, cookie)
 
         if len(parts) < 5:
             return f"{cookie} ERR invalid format: need COOKIE INVERTER_ID FUNC REG COUNT"
@@ -260,7 +291,7 @@ class GoodWeBridge:
         except ValueError:
             return f"{cookie} ERR invalid numeric values"
 
-        inverter = await goodwe.connect(host, port=port)
+        inverter = await self._connect(host, port)
 
         if func in (3, 4):
             return await self._read_registers(inverter, cookie, reg, count)
@@ -279,14 +310,99 @@ class GoodWeBridge:
         else:
             return f"{cookie} ERR unsupported function {func}"
 
+    # Sensor groups for read_runtime_data() queries
+    SENSOR_GROUPS = {
+        "pv": {"vpv1", "ipv1", "ppv1", "pv1_mode",
+               "vpv2", "ipv2", "ppv2", "pv2_mode",
+               "vpv3", "ipv3", "ppv3", "pv3_mode",
+               "vpv4", "ipv4", "ppv4", "pv4_mode"},
+        "battery": {"vbattery1", "ibattery1", "pbattery1",
+                    "battery_mode", "battery_soc", "battery_soh",
+                    "battery_temperature", "battery_status",
+                    "battery_charge_limit", "battery_discharge_limit",
+                    "battery_error", "battery_warning",
+                    "battery_bms", "battery_index",
+                    "battery_temperature_bms", "battery_charge_limit_bms",
+                    "battery_discharge_limit_bms", "battery_soc_bms"},
+        "grid": {"vgrid", "igrid", "pgrid", "fgrid", "grid_mode",
+                 "vgrid2", "igrid2", "pgrid2", "fgrid2", "grid_mode2",
+                 "vgrid3", "igrid3", "pgrid3", "fgrid3", "grid_mode3",
+                 "vload", "iload", "pload", "fload", "load_mode",
+                 "apparent_power", "reactive_power", "power_factor",
+                 "meter_power", "meter_power2", "meter_power3"},
+        "energy": {"e_total", "h_total", "e_day",
+                   "e_load_day", "e_load_total",
+                   "total_power", "active_power",
+                   "e_battery_charge_day", "e_battery_charge_total",
+                   "e_battery_discharge_day", "e_battery_discharge_total",
+                   "e_grid_export", "e_grid_import",
+                   "e_grid_export_day", "e_grid_import_day"},
+        "system": {"work_mode", "work_mode_label",
+                   "temperature", "temperature2",
+                   "error_codes", "warning_code",
+                   "safety_country", "safety_country_label",
+                   "diagnose_result", "diagnose_result_label",
+                   "effective_work_mode"},
+    }
+
     async def _device_info(self, host, port, cookie):
         """Query inverter model, serial number, and family."""
         try:
-            inverter = await goodwe.connect(host, port=port)
+            inverter = await self._connect(host, port)
             model = getattr(inverter, "model_name", "unknown")
             serial = getattr(inverter, "serial_number", "unknown")
             family = type(inverter).__name__
             return f"{cookie} OK model={model} serial={serial} family={family}"
+        except Exception as e:
+            return f"{cookie} ERR {e}"
+
+    async def _query_sensors(self, host, port, cookie, group):
+        """Query sensor data using read_runtime_data().
+
+        Args:
+            group: sensor group name (pv, battery, grid, energy, system, all)
+        """
+        try:
+            inverter = await self._connect(host, port)
+            data = await inverter.read_runtime_data()
+
+            if group == "all":
+                wanted = None  # Include everything
+            else:
+                wanted = self.SENSOR_GROUPS.get(group)
+                if wanted is None:
+                    return f"{cookie} ERR unknown group '{group}'"
+
+            pairs = []
+            for key, value in data.items():
+                if wanted is not None and key not in wanted:
+                    continue
+                # Format value — no spaces (space is the pair delimiter)
+                if isinstance(value, float):
+                    pairs.append(f"{key}={value:.2f}")
+                elif isinstance(value, bool):
+                    pairs.append(f"{key}={'1' if value else '0'}")
+                else:
+                    pairs.append(f"{key}={str(value).replace(' ', '_')}")
+
+            return f"{cookie} OK {' '.join(pairs)}"
+        except Exception as e:
+            return f"{cookie} ERR {e}"
+
+    async def _query_settings(self, host, port, cookie):
+        """Query inverter settings using read_settings_data()."""
+        try:
+            inverter = await self._connect(host, port)
+            data = await inverter.read_settings_data()
+            pairs = []
+            for key, value in data.items():
+                if isinstance(value, float):
+                    pairs.append(f"{key}={value:.2f}")
+                elif isinstance(value, bool):
+                    pairs.append(f"{key}={'1' if value else '0'}")
+                else:
+                    pairs.append(f"{key}={str(value).replace(' ', '_')}")
+            return f"{cookie} OK {' '.join(pairs)}"
         except Exception as e:
             return f"{cookie} ERR {e}"
 
@@ -322,43 +438,8 @@ class GoodWeBridge:
         except Exception as e:
             return f"{cookie} ERR {e}"
 
-    async def _discover_ranges(self, inverter):
-        """Determine register ranges to poll from sensor definitions."""
-        sensors = inverter.sensors()
-        if not sensors:
-            return []
-
-        entries = []
-        for s in sensors:
-            reg_count = max(1, (s.size_ + 1) // 2)
-            entries.append((s.offset, s.offset + reg_count - 1))
-        entries.sort()
-
-        # Merge into contiguous ranges (allow gap up to 10 registers)
-        ranges = []
-        start, end = entries[0]
-        for s, e in entries[1:]:
-            if s - end <= 10:
-                end = max(end, e)
-            else:
-                ranges.append((start, end - start + 1))
-                start, end = s, e
-        ranges.append((start, end - start + 1))
-
-        # Cap reads at 125 registers (standard Modbus limit)
-        final = []
-        for s, c in ranges:
-            while c > 125:
-                final.append((s, 125))
-                s += 125
-                c -= 125
-            if c > 0:
-                final.append((s, c))
-
-        return final
-
     async def _poll_inverter(self, inv_cfg):
-        """Poll one inverter's register ranges."""
+        """Poll one inverter using read_runtime_data()."""
         inv_id = str(inv_cfg.get("id", "0"))
         host = inv_cfg.get("host", "")
         port = int(inv_cfg.get("port", 8899))
@@ -368,39 +449,12 @@ class GoodWeBridge:
             return
 
         try:
-            inverter = await goodwe.connect(host, port=port)
-
-            if inv_id not in self._poll_ranges:
-                ranges = await self._discover_ranges(inverter)
-                self._poll_ranges[inv_id] = ranges
-                if ranges:
-                    log.info(
-                        "Inverter %s (%s): %d register ranges: %s",
-                        inv_id, name, len(ranges),
-                        ", ".join(f"{s}-{s + c - 1}" for s, c in ranges),
-                    )
-                else:
-                    log.warning("Inverter %s (%s): no sensor registers found", inv_id, name)
-                    return
-
-            for reg_start, count in self._poll_ranges[inv_id]:
-                try:
-                    cookie = f"poll_{self.poll_seq}_{inv_id}_{reg_start}"
-                    result = await self._read_registers(
-                        inverter, cookie, reg_start, count
-                    )
-                    self.client.publish(
-                        self.gw_config["response_topic"], result
-                    )
-                except Exception as e:
-                    log.warning(
-                        "Inverter %s poll %d-%d failed: %s",
-                        inv_id, reg_start, reg_start + count - 1, e,
-                    )
-
+            cookie = f"poll_{self.poll_seq}_{inv_id}"
+            result = await self._query_sensors(host, port, cookie, "all")
+            self.client.publish(self.gw_config["response_topic"], result)
         except Exception as e:
             log.error("Inverter %s (%s) poll failed: %s", inv_id, name, e)
-            self._poll_ranges.pop(inv_id, None)  # Reset cache on failure
+            self._inverter_cache.pop((host, port), None)
 
     async def _poll_all(self):
         """Poll all configured inverters."""

@@ -27,11 +27,13 @@ if [ ! -f "$CONFIG" ]; then
 fi
 
 if command -v jq &>/dev/null; then
+    GATEWAY_ID=$(jq -r '.gateway_id // ""' "$CONFIG")
     MQTT_HOST=$(jq -r '.mqtt.host // "127.0.0.1"' "$CONFIG")
     MQTT_PORT=$(jq -r '.mqtt.port // 1883' "$CONFIG")
     MQTT_USER=$(jq -r '.mqtt.username // ""' "$CONFIG")
     MQTT_PASS=$(jq -r '.mqtt.password // ""' "$CONFIG")
     MQTT_TLS=$(jq -r '.mqtt.tls // false' "$CONFIG")
+    MQTT_CLIENT_ID=$(jq -r '.mqtt.client_id // ""' "$CONFIG")
     REQ_TOPIC=$(jq -r '.request_topic // "goodwe/request"' "$CONFIG")
     RESP_TOPIC=$(jq -r '.response_topic // "goodwe/response"' "$CONFIG")
     INV_ID="${GOODWE_INV_ID:-$(jq -r '.inverters[0].id // "0"' "$CONFIG")}"
@@ -40,11 +42,13 @@ elif command -v python3 &>/dev/null; then
 import json, sys
 with open('$CONFIG') as f: c = json.load(f)
 m = c.get('mqtt', {})
+print(f'GATEWAY_ID=\"{c.get(\"gateway_id\", \"\")}\"')
 print(f'MQTT_HOST=\"{m.get(\"host\", \"127.0.0.1\")}\"')
 print(f'MQTT_PORT=\"{m.get(\"port\", 1883)}\"')
 print(f'MQTT_USER=\"{m.get(\"username\", \"\")}\"')
 print(f'MQTT_PASS=\"{m.get(\"password\", \"\")}\"')
 print(f'MQTT_TLS=\"{str(m.get(\"tls\", False)).lower()}\"')
+print(f'MQTT_CLIENT_ID=\"{m.get(\"client_id\", \"\")}\"')
 print(f'REQ_TOPIC=\"{c.get(\"request_topic\", \"goodwe/request\")}\"')
 print(f'RESP_TOPIC=\"{c.get(\"response_topic\", \"goodwe/response\")}\"')
 inv = c.get('inverters', [{}])
@@ -55,6 +59,14 @@ else
     echo "ERROR: Need jq or python3 to parse config."
     exit 1
 fi
+
+# Resolve gateway_id (default to hostname) and substitute topic variables
+GATEWAY_ID="${GATEWAY_ID:-$(hostname -s)}"
+MQTT_CLIENT_ID="${MQTT_CLIENT_ID:-$GATEWAY_ID}"
+REQ_TOPIC="${REQ_TOPIC//\{gateway_id\}/$GATEWAY_ID}"
+REQ_TOPIC="${REQ_TOPIC//\{client_id\}/$MQTT_CLIENT_ID}"
+RESP_TOPIC="${RESP_TOPIC//\{gateway_id\}/$GATEWAY_ID}"
+RESP_TOPIC="${RESP_TOPIC//\{client_id\}/$MQTT_CLIENT_ID}"
 
 # ── Build mosquitto auth/TLS args ────────────
 
@@ -91,19 +103,32 @@ fi
 COOKIE_BASE=$((RANDOM * 1000 + RANDOM))
 
 mqtt_request() {
-    # Send a request and return the response line
+    # Send a request and return the response line matching the cookie.
+    # Skips poll messages and other responses not matching our cookie.
     local message="$1"
     local cookie
     cookie=$(echo "$message" | awk '{print $1}')
 
-    # Start subscriber, capture response
+    local tmpfile
+    tmpfile=$(mktemp)
+
+    # Subscribe for up to 10 messages over 12 seconds, filter by cookie
+    timeout 15 mosquitto_sub $MQTT_ARGS -t "$RESP_TOPIC" -W 12 2>/dev/null | while read -r line; do
+        if echo "$line" | grep -q "^$cookie "; then
+            echo "$line" > "$tmpfile"
+            break
+        fi
+    done &
+    SUB_PID=$!
+
+    sleep 0.3
+    mosquitto_pub $MQTT_ARGS -t "$REQ_TOPIC" -m "$message"
+
+    wait $SUB_PID 2>/dev/null || true
+
     local response
-    response=$(timeout 10 mosquitto_sub $MQTT_ARGS -t "$RESP_TOPIC" -C 1 -W 8 2>/dev/null &
-        SUB_PID=$!
-        sleep 0.3
-        mosquitto_pub $MQTT_ARGS -t "$REQ_TOPIC" -m "$message"
-        wait $SUB_PID 2>/dev/null
-    )
+    response=$(cat "$tmpfile" 2>/dev/null)
+    rm -f "$tmpfile"
     echo "$response"
 }
 
@@ -160,15 +185,8 @@ detect_family() {
     local cookie=$((COOKIE_BASE++))
     echo "  Detecting inverter model..."
 
-    # Subscribe in background, publish info request
     local response
-    response=$(
-        timeout 10 mosquitto_sub $MQTT_ARGS -t "$RESP_TOPIC" -C 1 -W 8 2>/dev/null &
-        SUB_PID=$!
-        sleep 0.3
-        mosquitto_pub $MQTT_ARGS -t "$REQ_TOPIC" -m "$cookie $INV_ID info"
-        wait $SUB_PID 2>/dev/null
-    )
+    response=$(mqtt_request "$cookie $INV_ID info")
 
     if echo "$response" | grep -q "ERR"; then
         echo "  WARNING: Could not detect model. $response"
@@ -180,6 +198,7 @@ detect_family() {
 
     # Parse: <cookie> OK model=GW5048D-ES serial=... family=ES
     MODEL=$(echo "$response" | sed -n 's/.*model=\([^ ]*\).*/\1/p')
+    SERIAL=$(echo "$response" | sed -n 's/.*serial=\([^ ]*\).*/\1/p')
     FAMILY=$(echo "$response" | sed -n 's/.*family=\([^ ]*\).*/\1/p')
 
     if [ -z "$FAMILY" ]; then
@@ -191,49 +210,54 @@ detect_family() {
         return
     fi
 
-    echo "  Model: $MODEL  Family: $FAMILY"
+    echo "  Model: $MODEL  Serial: $SERIAL  Family: $FAMILY"
+}
+
+# ── Sensor query (uses read_runtime_data via bridge) ──
+
+query_sensors() {
+    local group="$1"
+    local label="$2"
+    local cookie=$((COOKIE_BASE++))
+
+    echo ""
+    echo "=== $label ==="
+    echo "  Request: $cookie $INV_ID $group"
+
+    local response
+    response=$(mqtt_request "$cookie $INV_ID $group")
+
+    if [ -z "$response" ]; then
+        echo "  (no response - timeout)"
+        return
+    fi
+
+    # Check for error
+    if echo "$response" | grep -q " ERR "; then
+        echo "  $response"
+        return
+    fi
+
+    # Parse key=value pairs from response: <cookie> OK key1=val1 key2=val2 ...
+    local data
+    data=$(echo "$response" | sed "s/^$cookie OK //")
+
+    # Pretty-print each key=value
+    for pair in $data; do
+        local key="${pair%%=*}"
+        local val="${pair#*=}"
+        printf "  %-35s %s\n" "$key" "$val"
+    done
 }
 
 # ── ES family queries (ES, EM, BP) ──────────
-# Runtime: internal byte offsets at 35100+
-# Has battery, backup/UPS capability
+# Uses read_runtime_data() — works with AA55 protocol
 
-query_es_pv() {
-    echo ""
-    echo "=== PV Solar Panel Data (ES) ==="
-    publish_read "PV1 Voltage, Current, Power, Mode" 35100 5
-    publish_read "PV2 Voltage, Current, Power, Mode" 35105 5
-}
-
-query_es_battery() {
-    echo ""
-    echo "=== Battery Data (ES) ==="
-    publish_read "Battery Voltage, Status, Temp" 35110 8
-    publish_read "Battery Current, Charge/Discharge Limits" 35118 12
-    publish_read "Battery SOC, SOH, Mode, Warnings" 35126 5
-}
-
-query_es_grid() {
-    echo ""
-    echo "=== Grid & Load Data (ES) ==="
-    publish_read "Meter Status, Grid V/I/P/F, Mode" 35133 10
-    publish_read "Load V/I/P/F, Mode, Work Mode" 35143 10
-}
-
-query_es_energy() {
-    echo ""
-    echo "=== Energy Totals (ES) ==="
-    publish_read "Total PV, Hours, Today PV" 35159 12
-    publish_read "Load Today, Load Total, Total Power" 35169 10
-}
-
-query_es_system() {
-    echo ""
-    echo "=== System Status (ES) ==="
-    publish_read "Temperature, Error Codes" 35153 6
-    publish_read "Work Mode, Relay, Grid In/Out, Backup Power" 35177 8
-    publish_read "Power Factor, Diagnostics" 35183 10
-}
+query_es_pv()      { query_sensors "pv"      "PV Solar Panel Data ($MODEL)"; }
+query_es_battery()  { query_sensors "battery" "Battery Data ($MODEL)"; }
+query_es_grid()     { query_sensors "grid"    "Grid & Load Data ($MODEL)"; }
+query_es_energy()   { query_sensors "energy"  "Energy Totals ($MODEL)"; }
+query_es_system()   { query_sensors "system"  "System Status ($MODEL)"; }
 
 query_es_settings() {
     echo ""
@@ -258,66 +282,17 @@ query_es_eco() {
 query_es_all() {
     echo ""
     echo "=== Full ES Inverter Dump ($MODEL) ==="
-    query_es_pv
-    query_es_battery
-    query_es_grid
-    query_es_energy
-    query_es_system
+    query_sensors "all" "All Sensor Data ($MODEL)"
 }
 
 # ── DT family queries (D-NS, DT, MS, XS) ───
-# Runtime: Modbus holding registers at 30100+
-# No battery, grid-tied only
+# Also uses read_runtime_data() via bridge
 
-query_dt_pv() {
-    echo ""
-    echo "=== PV Solar Panel Data (D-NS/DT) ==="
-    publish_read "Timestamp" 30100 3
-    publish_read "PV1 Voltage, Current" 30103 2
-    publish_read "PV2 Voltage, Current" 30105 2
-    publish_read "PV3 Voltage, Current" 30107 2
-}
-
-query_dt_grid() {
-    echo ""
-    echo "=== Grid & AC Output (D-NS/DT) ==="
-    publish_read "Line Voltages (L1-L3)" 30115 3
-    publish_read "Phase Voltages (L1-L3)" 30118 3
-    publish_read "Phase Currents (L1-L3)" 30121 3
-    publish_read "Phase Frequencies (L1-L3)" 30124 3
-    publish_read "Total Inverter Power" 30127 3
-}
-
-query_dt_system() {
-    echo ""
-    echo "=== System Status (D-NS/DT) ==="
-    publish_read "Work Mode" 30129 1
-    publish_read "Error Codes, Warning Code" 30130 3
-    publish_read "Apparent Power, Reactive Power" 30133 4
-    publish_read "Total Input Power, Power Factor" 30137 4
-    publish_read "Temperature, Heatsink Temp" 30141 2
-    publish_read "Bus Voltage, NBus Voltage" 30163 2
-    publish_read "Derating Mode" 30165 2
-    publish_read "WiFi RSSI" 30172 1
-}
-
-query_dt_energy() {
-    echo ""
-    echo "=== Energy Totals (D-NS/DT) ==="
-    publish_read "Today Generation" 30144 1
-    publish_read "Total Generation" 30145 2
-    publish_read "Total Hours" 30147 2
-}
-
-query_dt_meter() {
-    echo ""
-    echo "=== Meter / Grid Export-Import (D-NS/DT) ==="
-    publish_read "Meter Active Power" 30195 2
-    publish_read "Meter Total Export" 30197 2
-    publish_read "Meter Total Import" 30199 2
-    publish_read "Meter Comm Status" 30209 1
-    publish_read "Leakage Current" 30210 1
-}
+query_dt_pv()      { query_sensors "pv"      "PV Solar Panel Data ($MODEL)"; }
+query_dt_grid()    { query_sensors "grid"    "Grid & AC Output ($MODEL)"; }
+query_dt_system()  { query_sensors "system"  "System Status ($MODEL)"; }
+query_dt_energy()  { query_sensors "energy"  "Energy Totals ($MODEL)"; }
+query_dt_meter()   { query_sensors "grid"    "Meter / Grid Data ($MODEL)"; }
 
 query_dt_settings() {
     echo ""
@@ -335,11 +310,7 @@ query_dt_settings() {
 query_dt_all() {
     echo ""
     echo "=== Full D-NS/DT Inverter Dump ($MODEL) ==="
-    query_dt_pv
-    query_dt_grid
-    query_dt_energy
-    query_dt_system
-    query_dt_meter
+    query_sensors "all" "All Sensor Data ($MODEL)"
 }
 
 # ── Command handling ─────────────────────────
