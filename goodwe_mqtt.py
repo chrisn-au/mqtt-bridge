@@ -101,6 +101,8 @@ def load_mqtt_config():
                 cfg["tls"] = True
             if m.get("ca_cert"):
                 cfg["ca_cert"] = m["ca_cert"]
+            if m.get("client_id"):
+                cfg["client_id"] = m["client_id"]
             return cfg
     except (FileNotFoundError, json.JSONDecodeError, KeyError):
         pass
