@@ -293,7 +293,7 @@ class GoodWeBridge:
         try:
             cmd = inverter._protocol.read_command(offset, count)
             resp = await cmd.execute(inverter._protocol)
-            raw = resp._data.getvalue()
+            raw = resp.response_data()
             values = []
             for i in range(0, min(count * 2, len(raw)), 2):
                 val = struct.unpack(">H", raw[i : i + 2])[0]
